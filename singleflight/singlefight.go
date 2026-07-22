@@ -12,7 +12,7 @@ type call struct {
 // Group：singleflight管理器，维护所有key对应的请求
 type Group struct {
 	mu sync.Mutex           // 保护map m并发安全
-	m  map[string\]*call     // key -> 对应的请求实例call
+	m  map[string]*call     // key -> 对应的请求实例call
 }
 
 // 构造函数，初始化内部map
