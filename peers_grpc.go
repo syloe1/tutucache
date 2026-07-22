@@ -18,6 +18,7 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+// peers_grpc.go
 const (
 	defaultGRPCReplicas = 50
 )

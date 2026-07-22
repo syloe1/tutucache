@@ -1,6 +1,9 @@
 package lru
 
-import "container/list"
+import (
+	"container/list"
+	"time"
+)
 
 type Cache struct {
 	maxBytes int64
@@ -11,10 +14,11 @@ type Cache struct {
 	OnEvicted func(key string, value Value) //记录被移除时的回调函数
 }
 
-//list链表只能存一个任意变量， 但是我们同时需要key value, 所以我们封装一个entry结构体进去
+// list链表只能存一个任意变量， 但是我们同时需要key value, 所以我们封装一个entry结构体进去
 type entry struct {
-	key   string
-	value Value
+	key       string
+	value     Value
+	expiresAt time.Time //过期时间， 零代表永不过期
 }
 
 type Value interface {
@@ -31,10 +35,20 @@ func New(maxBytes int64, onEvicted func(string, Value)) *Cache {
 }
 func (c *Cache) Get(key string) (value Value, ok bool) {
 	if ele, ok := c.cache[key]; ok {
-		//命中，把节点移动到头部
-		c.ll.MoveToFront(ele)
 		//断言转换为结构体
 		kv := ele.Value.(*entry)
+		// 惰性过期：Get 时发现已过期，当场删除
+		if !kv.expiresAt.IsZero() && time.Now().After(kv.expiresAt) {
+			c.ll.Remove(ele)
+			delete(c.cache, kv.key)
+			c.nbytes -= int64(len(kv.key)) + int64(kv.value.Len())
+			if c.OnEvicted != nil {
+				c.OnEvicted(kv.key, kv.value)
+			}
+			return nil, false
+		}
+		//命中，把节点移动到头部
+		c.ll.MoveToFront(ele)
 		return kv.value, true
 	}
 	return
@@ -56,16 +70,21 @@ func (c *Cache) RemoveOldest() {
 	}
 }
 
-//更新缓存
-func (c *Cache) Add(key string, value Value) {
+// 更新缓存
+func (c *Cache) Add(key string, value Value, ttl time.Duration) {
+	var expiresAt time.Time
+	if ttl > 0 {
+		expiresAt = time.Now().Add(ttl)
+	}
 	if ele, ok := c.cache[key]; ok {
 		c.ll.MoveToFront(ele)
 		kv := ele.Value.(*entry)
 		//delta = 新value大小 - 旧value大小
 		c.nbytes += int64(value.Len()) - int64(kv.value.Len())
 		kv.value = value
+		kv.expiresAt = expiresAt
 	} else {
-		ele := c.ll.PushFront(&entry{key, value})
+		ele := c.ll.PushFront(&entry{key: key, value: value, expiresAt: expiresAt})
 		c.cache[key] = ele
 		c.nbytes += int64(len(key)) + int64(value.Len())
 	}
@@ -75,4 +94,24 @@ func (c *Cache) Add(key string, value Value) {
 }
 func (c *Cache) Len() int {
 	return c.ll.Len()
+}
+
+// CleanupExpired 扫描并删除所有已过期的条目（调用方负责加锁）
+func (c *Cache) CleanupExpired() int {
+	count := 0
+	for e := c.ll.Back(); e != nil; {
+		kv := e.Value.(*entry)
+		prev := e.Prev()
+		if !kv.expiresAt.IsZero() && time.Now().After(kv.expiresAt) {
+			c.ll.Remove(e)
+			delete(c.cache, kv.key)
+			c.nbytes -= int64(len(kv.key)) + int64(kv.value.Len())
+			if c.OnEvicted != nil {
+				c.OnEvicted(kv.key, kv.value)
+			}
+			count++
+		}
+		e = prev
+	}
+	return count
 }

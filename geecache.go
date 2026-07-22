@@ -6,6 +6,7 @@ import (
 	"geecache/singleflight"
 	"log"
 	"sync"
+	"time"
 )
 
 // 提供被其他节点访问的能力
@@ -27,6 +28,8 @@ type Group struct {
 	peers     PeerPicker
 	//用来合并并发请求
 	loader *singleflight.Group
+	// DefaultTTL 默认过期时间，0 表示永不过期
+	DefaultTTL time.Duration
 }
 
 func (g *Group) RegisterPeers(peers PeerPicker) {
@@ -133,5 +136,14 @@ func (g *Group) getLocal(key string) (ByteView, error) {
 
 // 写入本地缓存
 func (g *Group) populateCache(key string, value ByteView) {
-	g.mainCache.add(key, value)
+	g.mainCache.add(key, value, g.DefaultTTL)
+}
+
+// SetTTL 设置默认过期时间并启动后台清理
+// cleanupInterval 为 0 时不启动后台清理（仅依赖 Get 时的惰性删除）
+func (g *Group) SetTTL(ttl time.Duration, cleanupInterval time.Duration) {
+	g.DefaultTTL = ttl
+	if cleanupInterval > 0 {
+		g.mainCache.StartCleanup(cleanupInterval)
+	}
 }
