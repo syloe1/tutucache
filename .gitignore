@@ -1,7 +1,7 @@
 # 编译产物（run.sh / run.py 会生成的二进制文件）
 server
 server.exe
-
+extension.md
 # IDE
 .idea/
 .vscode/
