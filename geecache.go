@@ -75,9 +75,11 @@ func (g *Group) Get(key string) (ByteView, error) {
 	//查询本地并发LRU缓存
 	if v, ok := g.mainCache.get(key); ok {
 		log.Println("[GeeCache] hit")
+		globalMetrics.RecordHit()
 		return v, nil
 	}
 	//缓存未命中， 进入加载逻辑
+	globalMetrics.RecordMiss()
 	return g.load(key)
 }
 
@@ -116,10 +118,12 @@ func (g *Group) getFromPeer(peer PeerGetter, key string) (ByteView, error) {
 	if err != nil {
 		return ByteView{}, err
 	}
+	globalMetrics.RecordPeerLoad()
 	//包装成ByteView
 	return ByteView{b: res.Value}, nil
 }
 func (g *Group) getLocal(key string) (ByteView, error) {
+	globalMetrics.RecordLocalLoad()
 	//使用业务回调拉取原始数据
 	bytes, err := g.getter.Get(key)
 	if err != nil {

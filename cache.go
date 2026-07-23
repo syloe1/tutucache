@@ -19,7 +19,9 @@ func (c *cache) add(key string, value ByteView, ttl time.Duration) {
 	defer c.mu.Unlock()
 
 	if c.lru == nil {
-		c.lru = lru.New(c.cacheBytes, nil)
+		c.lru = lru.New(c.cacheBytes, func(key string, v lru.Value) {
+			globalMetrics.RecordEviction()
+		})
 	}
 	c.lru.Add(key, value, ttl)
 }
@@ -49,11 +51,13 @@ func (c *cache) StartCleanup(interval time.Duration) {
 		defer ticker.Stop()
 		for range ticker.C {
 			c.mu.Lock()
-			n := c.lru.CleanupExpired()
-			c.mu.Unlock()
-			if n > 0 {
-				log.Printf("[cache] cleaned up %d expired entries", n)
+			if c.lru != nil {
+				n := c.lru.CleanupExpired()
+				if n > 0 {
+					log.Printf("[cache] cleaned up %d expired entries", n)
+				}
 			}
+			c.mu.Unlock()
 		}
 	}()
 }

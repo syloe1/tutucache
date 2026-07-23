@@ -62,6 +62,12 @@ func (p *HTTPPool) Log(format string, v ...interface{}) {
 
 // 注册进http.Server，让它处理HTTP请求
 func (p *HTTPPool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// /metrics 端点 — 暴露缓存指标
+	if r.URL.Path == "/metrics" {
+		MetricsHandler().ServeHTTP(w, r)
+		return
+	}
+
 	if !strings.HasPrefix(r.URL.Path, p.basePath) {
 		panic("HTTPPool serving unexpected path: " + r.URL.Path)
 	}
