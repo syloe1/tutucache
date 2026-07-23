@@ -62,6 +62,13 @@ func (p *HTTPPool) Log(format string, v ...interface{}) {
 
 // 注册进http.Server，让它处理HTTP请求
 func (p *HTTPPool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// /health 端点 — 健康检查
+	if r.URL.Path == "/health" {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("OK"))
+		return
+	}
+
 	// /metrics 端点 — 暴露缓存指标
 	if r.URL.Path == "/metrics" {
 		MetricsHandler().ServeHTTP(w, r)
