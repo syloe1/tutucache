@@ -30,6 +30,8 @@ type Group struct {
 	loader *singleflight.Group
 	// DefaultTTL 默认过期时间，0 表示永不过期
 	DefaultTTL time.Duration
+	// breaker 远程节点熔断器，失败 N 次后跳过远程直接降级到本地
+	breaker *CircuitBreaker
 }
 
 func (g *Group) RegisterPeers(peers PeerPicker) {
@@ -57,7 +59,8 @@ func NewGroup(name string, cacheBytes int64, getter Getter) *Group {
 		mainCache: cache{
 			cacheBytes: cacheBytes,
 		},
-		loader: singleflight.NewGroup(),
+		loader:  singleflight.NewGroup(),
+		breaker: NewCircuitBreaker(3, 10*time.Second), // 连续失败3次 → 熔断10秒
 	}
 	groups[name] = g
 	return g
@@ -109,6 +112,11 @@ func (g *Group) load(key string) (value ByteView, err error) {
 
 // 向远程GeeCache节点发起网络请求，获取缓存
 func (g *Group) getFromPeer(peer PeerGetter, key string) (ByteView, error) {
+	// 熔断器打开 → 快速失败，上层 load() 自动降级到 getLocal()
+	if g.breaker.IsOpen() {
+		return ByteView{}, ErrCircuitOpen
+	}
+
 	req := &pb.Request{
 		Group: g.name,
 		Key:   key,
@@ -116,8 +124,11 @@ func (g *Group) getFromPeer(peer PeerGetter, key string) (ByteView, error) {
 	res := &pb.Response{}
 	err := peer.Get(req, res)
 	if err != nil {
+		g.breaker.RecordFailure() // 失败计数+1
 		return ByteView{}, err
 	}
+
+	g.breaker.RecordSuccess() // 成功 → 重置熔断器
 	globalMetrics.RecordPeerLoad()
 	//包装成ByteView
 	return ByteView{b: res.Value}, nil

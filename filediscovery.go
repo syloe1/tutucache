@@ -84,11 +84,11 @@ func (d *FileDiscovery) Watch(onChange func([]string)) {
 			case <-ticker.C:
 				peers, err := d.GetPeers()
 				if err != nil {
-					log.Printf("[FileDiscovery] read peers error: %v" err)
+					log.Printf("[FileDiscovery] read peers error: %v", err)
 					continue 
 				}
 				if !sameSlice(peers, lastPeers) {
-					log.Printf("\[FileDiscovery\] peers changed: %v", peers)
+					log.Printf("[FileDiscovery] peers changed: %v", peers)
 					onChange(peers)       // 节点变化！触发回调通知上层
 					lastPeers = peers     // 更新基准列表
 				}
