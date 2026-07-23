@@ -35,7 +35,24 @@ func createGroup() *geecache.Group {
 func startCacheServer(addr string, gee *geecache.Group) (*http.Server, *geecache.HTTPPool) {
 	pool := geecache.NewHTTPPool(addr)
 
-	// 使用文件服务发现替代硬编码
+	// 共享 Token 认证（环境变量 GEECACHE_TOKEN）
+	if token := os.Getenv("GEECACHE_TOKEN"); token != "" {
+		pool.SetSharedToken(token)
+		log.Println("shared token auth enabled")
+	}
+
+	// TLS 加密（环境变量 GEECACHE_CERT / GEECACHE_KEY / GEECACHE_CA）
+	certFile := os.Getenv("GEECACHE_CERT")
+	keyFile := os.Getenv("GEECACHE_KEY")
+	if certFile != "" && keyFile != "" {
+		caFile := os.Getenv("GEECACHE_CA")
+		if err := pool.EnableTLS(certFile, keyFile, caFile); err != nil {
+			log.Fatalf("TLS setup failed: %v", err)
+		}
+		log.Println("TLS enabled")
+	}
+
+	// 服务发现
 	discovery := geecache.NewFileDiscovery(addr, peersFile)
 	if err := pool.StartDiscovery(discovery); err != nil {
 		log.Fatalf("discovery register failed: %v", err)
@@ -43,7 +60,7 @@ func startCacheServer(addr string, gee *geecache.Group) (*http.Server, *geecache
 
 	gee.RegisterPeers(pool)
 
-	hostPort := addr[7:] // 去掉 "http://" 前缀
+	hostPort := addr[7:]
 	srv := &http.Server{
 		Addr:    hostPort,
 		Handler: pool,
@@ -51,7 +68,13 @@ func startCacheServer(addr string, gee *geecache.Group) (*http.Server, *geecache
 
 	go func() {
 		log.Printf("geecache is running at %s", hostPort)
-		if err := srv.ListenAndServe(); err != http.ErrServerClosed {
+		var err error
+		if pool.TLSConfig() != nil {
+			err = srv.ListenAndServeTLS(certFile, keyFile)
+		} else {
+			err = srv.ListenAndServe()
+		}
+		if err != http.ErrServerClosed {
 			log.Fatalf("geecache server error: %v", err)
 		}
 		log.Printf("geecache server %s stopped", hostPort)
