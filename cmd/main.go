@@ -13,6 +13,8 @@ import (
 	"time"
 )
 
+const peersFile = "peers.json"
+
 var db = map[string]string{
 	"Tom":  "630",
 	"Jack": "589",
@@ -30,15 +32,21 @@ func createGroup() *geecache.Group {
 		}))
 }
 
-func startCacheServer(addr string, addrs []string, gee *geecache.Group) *http.Server {
-	peers := geecache.NewHTTPPool(addr)
-	peers.Set(addrs...)
-	gee.RegisterPeers(peers)
+func startCacheServer(addr string, gee *geecache.Group) (*http.Server, *geecache.HTTPPool) {
+	pool := geecache.NewHTTPPool(addr)
+
+	// 使用文件服务发现替代硬编码
+	discovery := geecache.NewFileDiscovery(addr, peersFile)
+	if err := pool.StartDiscovery(discovery); err != nil {
+		log.Fatalf("discovery register failed: %v", err)
+	}
+
+	gee.RegisterPeers(pool)
 
 	hostPort := addr[7:] // 去掉 "http://" 前缀
 	srv := &http.Server{
 		Addr:    hostPort,
-		Handler: peers,
+		Handler: pool,
 	}
 
 	go func() {
@@ -49,7 +57,7 @@ func startCacheServer(addr string, addrs []string, gee *geecache.Group) *http.Se
 		log.Printf("geecache server %s stopped", hostPort)
 	}()
 
-	return srv
+	return srv, pool
 }
 
 func startAPIServer(apiAddr string, gee *geecache.Group) *http.Server {
@@ -89,26 +97,25 @@ func main() {
 	flag.BoolVar(&api, "api", false, "Start a api server?")
 	flag.Parse()
 
-	apiAddr := "http://localhost:9999"
-	addrMap := map[int]string{
+	// 每个端口对应一个地址
+	portToAddr := map[int]string{
 		8001: "http://localhost:8001",
 		8002: "http://localhost:8002",
 		8003: "http://localhost:8003",
 	}
-
-	var addrs []string
-	for _, v := range addrMap {
-		addrs = append(addrs, v)
+	addr := portToAddr[port]
+	if addr == "" {
+		log.Fatalf("unsupported port: %d (use 8001/8002/8003)", port)
 	}
 
 	gee := createGroup()
 
 	// 启动服务
-	var cacheSrv, apiSrv *http.Server
+	var apiSrv *http.Server
 	if api {
-		apiSrv = startAPIServer(apiAddr, gee)
+		apiSrv = startAPIServer("http://localhost:9999", gee)
 	}
-	cacheSrv = startCacheServer(addrMap[port], addrs, gee)
+	cacheSrv, _ := startCacheServer(addr, gee)
 
 	// =========================================================================
 	// 等待退出信号，执行优雅关闭
@@ -118,7 +125,6 @@ func main() {
 	sig := <-quit
 	log.Printf("received signal %s, shutting down...", sig)
 
-	// 给每个 server 最多 10 秒完成正在处理的请求
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 

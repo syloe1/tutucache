@@ -121,6 +121,22 @@ func (p *HTTPPool) Set(peers ...string) {
 	}
 }
 
+// StartDiscovery 将当前节点注册到服务发现，并监听节点变更自动更新哈希环
+func (p *HTTPPool) StartDiscovery(d ServiceDiscovery) error {
+	// 1. 把自己注册进去
+	if err := d.Register(p.self); err != nil {
+		return err
+	}
+
+	// 2. 监听节点变化 → 自动调 Set 重建哈希环
+	d.Watch(func(peers []string) {
+		p.Log("discovery: peers updated %v", peers)
+		p.Set(peers...)
+	})
+
+	return nil
+}
+
 // 返回节点对应的客户端
 func (p *HTTPPool) PickPeer(key string) (PeerGetter, bool) {
 	p.mu.Lock()

@@ -1,6 +1,8 @@
 # 编译产物（run.sh / run.py 会生成的二进制文件）
 server
 server.exe
+# 服务发现运行时文件
+peers.json
 
 # IDE
 .idea/
