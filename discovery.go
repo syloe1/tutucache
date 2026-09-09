@@ -8,3 +8,5 @@ type ServiceDiscovery interface {
 	//监听节点变更
 	Watch(onChange func([]string))
 }
+
+//cc

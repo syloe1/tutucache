@@ -22,6 +22,7 @@ var db = map[string]string{
 }
 
 func createGroup() *geecache.Group {
+	// 最大内存两KB
 	return geecache.NewGroup("scores", 2<<10, geecache.GetterFunc(
 		func(key string) ([]byte, error) {
 			log.Println("[SlowDB] search key", key)
@@ -32,6 +33,7 @@ func createGroup() *geecache.Group {
 		}))
 }
 
+// 启动**集群内部节点服务**（节点之间通信）
 func startCacheServer(addr string, gee *geecache.Group) (*http.Server, *geecache.HTTPPool) {
 	pool := geecache.NewHTTPPool(addr)
 
@@ -54,10 +56,11 @@ func startCacheServer(addr string, gee *geecache.Group) (*http.Server, *geecache
 
 	// 服务发现
 	discovery := geecache.NewFileDiscovery(addr, peersFile)
+	// 给HTTPPool绑定服务发现
 	if err := pool.StartDiscovery(discovery); err != nil {
 		log.Fatalf("discovery register failed: %v", err)
 	}
-
+	// 给Group注册 [节点选择器PeerPicker]
 	gee.RegisterPeers(pool)
 
 	hostPort := addr[7:]
@@ -65,7 +68,7 @@ func startCacheServer(addr string, gee *geecache.Group) (*http.Server, *geecache
 		Addr:    hostPort,
 		Handler: pool,
 	}
-
+	//在后台异步启动缓存节点的 HTTP 服务
 	go func() {
 		log.Printf("geecache is running at %s", hostPort)
 		var err error
@@ -95,15 +98,16 @@ func startAPIServer(apiAddr string, gee *geecache.Group) *http.Server {
 			w.Header().Set("Content-Type", "application/octet-stream")
 			w.Write(view.ByteSlice())
 		}))
-
+	//`apiAddr="http://localhost:9999"`，`apiAddr[7:]` 截取后得到 `localhost:9999`
 	hostPort := apiAddr[7:]
 	srv := &http.Server{
 		Addr:    hostPort,
 		Handler: nil, // 使用 DefaultServeMux
 	}
-
+	//新开 goroutine 异步启动 API 服务：
 	go func() {
 		log.Printf("frontend server is running at %s", hostPort)
+		//`ListenAndServe()` 阻塞，监听 9999 端口，接收用户 http 请求
 		if err := srv.ListenAndServe(); err != http.ErrServerClosed {
 			log.Fatalf("API server error: %v", err)
 		}
@@ -119,8 +123,17 @@ func main() {
 	flag.IntVar(&port, "port", 8001, "Geecache server port")
 	flag.BoolVar(&api, "api", false, "Start a api server?")
 	flag.Parse()
+	/*
 
+	   # port=8001，api=false（不启动9999前端API）
+	   go run main.go -port 8001
+
+	   # port=8001，api=true（启动9999前端API服务）
+	   go run main.go -port 8001 -api
+
+	*/
 	// 每个端口对应一个地址
+	// 端口 -> 节点完整地址映射
 	portToAddr := map[int]string{
 		8001: "http://localhost:8001",
 		8002: "http://localhost:8002",
@@ -130,7 +143,7 @@ func main() {
 	if addr == "" {
 		log.Fatalf("unsupported port: %d (use 8001/8002/8003)", port)
 	}
-
+	//创建缓存 Group 实例
 	gee := createGroup()
 
 	// 启动服务
@@ -138,6 +151,7 @@ func main() {
 	if api {
 		apiSrv = startAPIServer("http://localhost:9999", gee)
 	}
+	//启动**集群内部通信缓存节点服务**
 	cacheSrv, _ := startCacheServer(addr, gee)
 
 	// =========================================================================
@@ -147,7 +161,7 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	sig := <-quit
 	log.Printf("received signal %s, shutting down...", sig)
-
+	//收到信号后才走ctx这里，然后优雅关闭
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 

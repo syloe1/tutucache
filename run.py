@@ -1,6 +1,7 @@
 import subprocess
 import time
 import os
+import json
 import signal
 import sys
 
@@ -22,9 +23,10 @@ def cleanup(signum=None, frame=None):
     if sys.platform == "win32":
         subprocess.run(["taskkill", "/F", "/IM", "server.exe"],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    # 删除编译产物
-    if os.path.exists("server.exe"):
-        os.remove("server.exe")
+    # 删除编译产物 + 服务发现文件
+    for f in ("server.exe", "peers.json"):
+        if os.path.exists(f):
+            os.remove(f)
     print("[Cleanup] done")
     sys.exit(0)
 
@@ -44,6 +46,15 @@ def main():
     if ret.returncode != 0 or not os.path.exists("server.exe"):
         print("[Error] Go 编译失败，请检查 main.go 入口文件")
         return
+
+    # 2.5 预创建 peers.json：3 个节点并发 Register 会互相覆盖，
+    # 先写入完整节点列表，让各节点读到同一份内容（与 run.sh 一致）
+    with open("peers.json", "w") as f:
+        json.dump([
+            "http://localhost:8001",
+            "http://localhost:8002",
+            "http://localhost:8003",
+        ], f, indent=2)
 
     # 3. 启动3个后台服务
     if sys.platform == "win32":
@@ -65,12 +76,15 @@ def main():
 
     # 等待所有节点健康就绪
     import urllib.request
+    # 禁用代理：本机 localhost 健康检查不应走系统代理（如 Clash 的 HTTP_PROXY），
+    # 否则 urllib 会把请求路由到代理导致超时
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     print("[Wait] 等待所有节点就绪...")
     for port in [8001, 8002, 8003]:
         ready = False
         for _ in range(30):  # 最多等 6 秒
             try:
-                urllib.request.urlopen(f"http://localhost:{port}/health", timeout=0.5)
+                opener.open(f"http://localhost:{port}/health", timeout=0.5)
                 ready = True
                 break
             except Exception:

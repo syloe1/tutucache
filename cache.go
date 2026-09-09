@@ -19,6 +19,7 @@ func (c *cache) add(key string, value ByteView, ttl time.Duration) {
 	defer c.mu.Unlock()
 
 	if c.lru == nil {
+		// 懒初始化，第一次add才创建lru
 		c.lru = lru.New(c.cacheBytes, func(key string, v lru.Value) {
 			globalMetrics.RecordEviction()
 		})
@@ -37,6 +38,7 @@ func (c *cache) get(key string) (value ByteView, ok bool) {
 		return
 	}
 	if v, ok := c.lru.Get(key); ok {
+		// v.(ByteView)是类型断言
 		return v.(ByteView), ok
 
 	}
@@ -49,6 +51,7 @@ func (c *cache) StartCleanup(interval time.Duration) {
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
+		// ticker.C 是一个 <-chan Time  只读通道
 		for range ticker.C {
 			c.mu.Lock()
 			if c.lru != nil {
@@ -61,3 +64,5 @@ func (c *cache) StartCleanup(interval time.Duration) {
 		}
 	}()
 }
+
+//cc

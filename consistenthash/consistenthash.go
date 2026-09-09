@@ -33,6 +33,7 @@ func New(replicas int, fn Hash) *Map {
 
 // Add 添加真实节点，支持多个
 func (m *Map) Add(keys ...string) {
+	//key是服务地址
 	for _, key := range keys {
 		// 每个真实节点生成 replicas 个虚拟节点
 		for i := 0; i < m.replicas; i++ {
@@ -64,3 +65,5 @@ func (m *Map) Get(key string) string {
 	// 环形取模，超出尾部则取第一个节点
 	return m.hashMap[m.keys[idx%len(m.keys)]]
 }
+
+//cc

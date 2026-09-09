@@ -92,3 +92,5 @@ func MetricsHandler() http.Handler {
 		fmt.Fprintf(w, "geecache_cache_bytes %d\n", s.TotalBytes)
 	})
 }
+
+//cc

@@ -24,6 +24,7 @@ const (
 	StateHalfOpen              // 半开：放行一个探测请求
 )
 
+// cc
 // ErrCircuitOpen 熔断打开时返回的错误，调用方据此触发降级
 var ErrCircuitOpen = fmt.Errorf("circuit breaker is open")
 

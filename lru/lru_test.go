@@ -86,3 +86,35 @@ func TestTTLExpiry(t *testing.T) {
 		t.Fatal("forever should still exist")
 	}
 }
+
+func TestCleanupExpired(t *testing.T) {
+	keys := make([]string, 0)
+	callback := func(key string, v Value) {
+		keys = append(keys, key)
+	}
+	lru := New(int64(1000), callback)
+	lru.Add("k1", String("v1"), 10*time.Millisecond)
+	lru.Add("k2", String("v2"), 10*time.Millisecond)
+	lru.Add("k3", String("v3"), 0)
+
+	time.Sleep(20 * time.Millisecond)
+	delCnt := lru.CleanupExpired()
+	if delCnt != 2 {
+		t.Fatalf("expect delete 2 expired keys, got %d", delCnt)
+	}
+	if lru.Len() != 1 {
+		t.Fatalf("expect len=1")
+	}
+	if !reflect.DeepEqual([]string{"k1", "k2"}, keys) {
+		t.Fatalf("expire callback keys wrong")
+	}
+}
+
+func TestAddUpdateExistKey(t *testing.T) {
+	lru := New(int64(1000), nil)
+	lru.Add("k1", String("abc"), 0)
+	lru.Add("k1", String("abcd"), 0) // 更新value
+	if v, ok := lru.Get("k1"); !ok || string(v.(String)) != "abcd" {
+		t.Fatal("update value failed")
+	}
+}
