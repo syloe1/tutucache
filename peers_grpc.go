@@ -58,6 +58,11 @@ type grpcGetter struct {
 // 编译期断言：grpcGetter 实现了 PeerGetter
 var _ PeerGetter = (*grpcGetter)(nil)
 
+// String 返回对端地址，便于日志输出。
+func (g *grpcGetter) String() string {
+	return g.addr
+}
+
 // Get 适配层：gRPC 风格 (ctx, req) → (*Resp, error)  →  PeerGetter 风格 (in, out) → error
 func (g *grpcGetter) Get(in *pb.Request, out *pb.Response) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)

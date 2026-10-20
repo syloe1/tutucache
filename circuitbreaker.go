@@ -60,7 +60,8 @@ func NewCircuitBreaker(thresh int, timeout time.Duration) *CircuitBreaker {
 }
 
 // Allow 申请准入。ok 为 false 表示熔断中，调用方应跳过远程请求直接降级；
-// ok 为 true 时，调用方必须用返回的 ticket 恰好回填一次成功或失败。
+// ok 为 true 时，调用方必须用返回的 ticket 恰好回填一次结果（成功/失败/中立）。
+// 漏掉回填会让 HalfOpen 的探测名额永久占用。
 func (cb *CircuitBreaker) Allow() (Ticket, bool) {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
@@ -115,6 +116,19 @@ func (cb *CircuitBreaker) RecordSuccess(t Ticket) {
 		cb.failureCount = 0
 		cb.generation++
 	}
+}
+
+// RecordNeutral 释放 HalfOpen 的探测名额，但不改变失败计数。
+// 用于「对端有明确响应、但属于配置错误」的场景：既不是远端故障，也不是成功。
+// 探测名额必须释放，否则 HalfOpen 会永久卡住，后续请求全部静默降级。
+func (cb *CircuitBreaker) RecordNeutral(t Ticket) {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+
+	if t.generation != cb.generation || cb.state != StateHalfOpen || !cb.probeInFlight {
+		return
+	}
+	cb.probeInFlight = false
 }
 
 // RecordFailure 请求失败时调用：递增连续失败计数，达到阈值进入熔断；

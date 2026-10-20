@@ -144,8 +144,13 @@ func (g *Group) load(key string) (value ByteView, err error) {
 				if value, err = g.getFromPeer(peer, key); err == nil {
 					return value, nil
 				}
-				// 请求远程节点失败了， 降级
-				log.Println("[GeeCache] Failed to get from peer", err)
+				// 区分配置错误 / 临时故障
+				if isPeerConfigError(err) {
+					log.Printf("[ERROR] [GeeCache] peer configuration error: peer=%s key=%q: %v", peer, key, err)
+					return nil, err
+				}
+				// 5xx、网络超时、连接失败：临时故障，降级本地
+				log.Printf("[WARN] [GeeCache] remote load failed, falling back to local: peer=%s key=%q: %v", peer, key, err)
 			}
 		}
 		//key是本地 / 远程节点请求失败
@@ -175,7 +180,14 @@ func (g *Group) getFromPeer(peer PeerGetter, key string) (ByteView, error) {
 	//rpc调用
 	err := peer.Get(req, res)
 	if err != nil {
-		g.breaker.RecordFailure(ticket) // 失败计数+1
+		switch {
+		case isPeerConfigError(err):
+			// 配置错误说明对端可达，不计入熔断失败；但 ticket 必须回填，
+			// 否则 HalfOpen 的探测名额会被永久占用。
+			g.breaker.RecordNeutral(ticket)
+		default:
+			g.breaker.RecordFailure(ticket) // 失败计数+1
+		}
 		return ByteView{}, err
 	}
 
