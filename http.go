@@ -23,6 +23,12 @@ const (
 	defaultReplicas = 50 //虚拟节点数量
 	// SharedTokenHeader 节点间认证 token 的 HTTP 头
 	SharedTokenHeader = "X-Geecache-Token" //http请求头
+
+	// HTTP 客户端连接池参数。每个 peer 一个 transport，显式设置空闲连接
+	// 上限和回收时间，避免节点失联或拓扑变化后 keep-alive 连接无限堆积。
+	idleConnTimeout     = 90 * time.Second
+	maxIdleConns        = 100
+	maxIdleConnsPerHost = 32
 )
 
 // =============================================================================
@@ -34,6 +40,7 @@ type HTTPPool struct {
 	basePath    string                 // 路由前缀 /_geecache/
 	mu          sync.Mutex             // 保护 peers、httpGetters 的并发锁
 	peers       *consistenthash.Map    // 一致性哈希环，保存所有集群节点
+	peersList   []string               // 上一次 Set 的节点列表，用于跳过无变化的重建
 	httpGetters map[string]*httpGetter // key:节点地址，value:该节点的http客户端
 	// TLS / 认证配置（可选）
 	tlsConfig   *tls.Config
@@ -158,18 +165,57 @@ func (p *HTTPPool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (p *HTTPPool) Set(peers ...string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
+	// FileDiscovery 每 3 秒回调一次。节点集合和认证/TLS 配置都没变时直接返回，
+	// 避免周期性地重建哈希环和全部 transport（重建会让 keep-alive 连接失去复用）。
+	if sameSlice(peers, p.peersList) && p.gettersCurrent() {
+		return
+	}
+
 	//创建一致性哈希环
 	p.peers = consistenthash.New(defaultReplicas, nil)
 	p.peers.Add(peers...) //把所有集群真实节点，加到哈希环上
+
+	oldGetters := p.httpGetters
 	//key是节点地址字符串， value是访问远程节点的HTTP客户端
 	p.httpGetters = make(map[string]*httpGetter, len(peers))
 	for _, peer := range peers {
 		if peer == p.self {
 			continue
 		}
+		// 拓扑变化时复用仍然存在的节点客户端：幸存节点的 transport 和
+		// keep-alive 连接可以继续使用，只有新增节点才需要新建客户端。
+		if getter, ok := oldGetters[peer]; ok && getter.matches(p.tlsConfig, p.sharedToken) {
+			p.httpGetters[peer] = getter
+			continue
+		}
 		//peer 是`http://127.0.0.1:8001`，basePath 是`/geecache/`，得到 `http://127.0.0.1:8001/geecache/`
 		p.httpGetters[peer] = newHTTPGetter(peer+p.basePath, p.tlsConfig, p.sharedToken)
 	}
+	p.peersList = append([]string(nil), peers...)
+
+	// 被移除（或配置已变化）的旧客户端不再被使用，立即关闭其空闲 keep-alive
+	// 连接；否则每次拓扑变化都会残留一批永远不会被复用的 ESTABLISHED 连接。
+	for peer, getter := range oldGetters {
+		if p.httpGetters[peer] != getter {
+			getter.close()
+		}
+	}
+}
+
+// gettersCurrent 报告当前 httpGetters 是否已经与节点列表、TLS 和 token 配置一致。
+// 调用方必须持有 p.mu。
+func (p *HTTPPool) gettersCurrent() bool {
+	for _, peer := range p.peersList {
+		if peer == p.self {
+			continue
+		}
+		getter, ok := p.httpGetters[peer]
+		if !ok || !getter.matches(p.tlsConfig, p.sharedToken) {
+			return false
+		}
+	}
+	return true
 }
 
 func (p *HTTPPool) StartDiscovery(d ServiceDiscovery) error {
@@ -213,6 +259,7 @@ type httpGetter struct {
 	baseURL     string
 	httpClient  *http.Client
 	sharedToken string
+	tlsConfig   *tls.Config
 }
 
 // newHTTPGetter 创建客户端（包内使用）
@@ -220,7 +267,10 @@ func newHTTPGetter(baseURL string, tlsCfg *tls.Config, sharedToken string) *http
 	//`http.Transport`：**HTTP 底层传输层**
 	// 如果传入 TLS 配置，HTTPS 握手时使用这套证书配置，开启 TLS/mTLS 加密
 	transport := &http.Transport{
-		TLSClientConfig: tlsCfg,
+		TLSClientConfig:     tlsCfg,
+		MaxIdleConns:        maxIdleConns,
+		MaxIdleConnsPerHost: maxIdleConnsPerHost,
+		IdleConnTimeout:     idleConnTimeout,
 	}
 	return &httpGetter{
 		baseURL: baseURL,
@@ -229,7 +279,18 @@ func newHTTPGetter(baseURL string, tlsCfg *tls.Config, sharedToken string) *http
 			Timeout:   2 * time.Second,
 		},
 		sharedToken: sharedToken,
+		tlsConfig:   tlsCfg,
 	}
+}
+
+// matches 报告该客户端是否仍使用给定的 TLS/token 配置。
+func (h *httpGetter) matches(tlsCfg *tls.Config, sharedToken string) bool {
+	return h.tlsConfig == tlsCfg && h.sharedToken == sharedToken
+}
+
+// close 关闭客户端的空闲 keep-alive 连接。正在进行的请求不受影响。
+func (h *httpGetter) close() {
+	h.httpClient.CloseIdleConnections()
 }
 
 func (h *httpGetter) Get(in *pb.Request, out *pb.Response) error {
