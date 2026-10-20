@@ -3,6 +3,7 @@ package geecache
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"geecache/consistenthash"
 	pb "geecache/geecachepb"
@@ -30,6 +31,33 @@ const (
 	maxIdleConns        = 100
 	maxIdleConnsPerHost = 32
 )
+
+// PeerHTTPError 表示对端返回了非 200 的 HTTP 状态码。
+// 调用方可用 errors.As 区分配置错误和远端临时故障。
+type PeerHTTPError struct {
+	StatusCode int
+}
+
+func (e *PeerHTTPError) Error() string {
+	return fmt.Sprintf("peer returned HTTP %d %s", e.StatusCode, http.StatusText(e.StatusCode))
+}
+
+// IsConfigError 表示集群配置不一致（鉴权失败或对端未注册该 group），
+// 这类错误应暴露给调用方，禁止静默降级到本地。
+func (e *PeerHTTPError) IsConfigError() bool {
+	switch e.StatusCode {
+	case http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound:
+		return true
+	default:
+		return false
+	}
+}
+
+// isPeerConfigError 判断是否为集群配置错误（401/403/404）
+func isPeerConfigError(err error) bool {
+	var peerErr *PeerHTTPError
+	return errors.As(err, &peerErr) && peerErr.IsConfigError()
+}
 
 // =============================================================================
 // HTTPPool — 节点间 HTTP 通信（服务端 + 客户端管理）
@@ -143,13 +171,16 @@ func (p *HTTPPool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 输入key, 返回缓存数据ByteVie, 找不到报错
 	view, err := group.Get(key)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		// 详细错误只写服务端日志，不返回给客户端
+		p.Log("get key %q failed: %v", key, err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 	//Proto序列化
 	body, err := proto.Marshal(&pb.Response{Value: view.ByteSlice()})
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		p.Log("marshal response for key %q failed: %v", key, err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 
@@ -293,6 +324,11 @@ func (h *httpGetter) close() {
 	h.httpClient.CloseIdleConnections()
 }
 
+// String 返回对端地址，避免日志打印出 sharedToken 等内部字段。
+func (h *httpGetter) String() string {
+	return h.baseURL
+}
+
 func (h *httpGetter) Get(in *pb.Request, out *pb.Response) error {
 	u := fmt.Sprintf(
 		"%v%v/%v",
@@ -304,7 +340,7 @@ func (h *httpGetter) Get(in *pb.Request, out *pb.Response) error {
 	// 构造Get请求
 	req, err := http.NewRequest("GET", u, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("build peer http request: %w", err)
 	}
 	if h.sharedToken != "" {
 		// 添加 kv键值对
@@ -313,21 +349,24 @@ func (h *httpGetter) Get(in *pb.Request, out *pb.Response) error {
 	// 发起网络请求， 阻塞等待远端B节点返回HTTP响应
 	res, err := h.httpClient.Do(req)
 	if err != nil {
-		return err
+		// 连接超时， 连接拒绝， DNS失败，返回普通Error
+		return fmt.Errorf("http get peer: %w", err)
 	}
 	defer res.Body.Close()
 
 	if res.StatusCode != http.StatusOK {
-		return fmt.Errorf("server returned: %v", res.Status)
+		return &PeerHTTPError{
+			StatusCode: res.StatusCode,
+		}
 	}
 
 	bytes, err := io.ReadAll(res.Body)
 	if err != nil {
-		return fmt.Errorf("reading response body: %v", err)
+		return fmt.Errorf("reading peer response body: %w", err)
 	}
 	//反序列化
 	if err = proto.Unmarshal(bytes, out); err != nil {
-		return fmt.Errorf("decoding response body: %v", err)
+		return fmt.Errorf("unmarshal peer protobuf response: %w", err)
 	}
 	return nil
 }

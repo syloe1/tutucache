@@ -4,15 +4,221 @@ import (
 	"errors"
 	"fmt"
 	pb "geecache/geecachepb"
+	"io"
 	"log"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
+
+// stubPeerGetter 模拟 peer，返回指定错误并记录调用次数。
+type stubPeerGetter struct {
+	err   error
+	calls atomic.Int32
+}
+
+func (s *stubPeerGetter) Get(*pb.Request, *pb.Response) error {
+	s.calls.Add(1)
+	return s.err
+}
+
+func (s *stubPeerGetter) String() string { return "stub-peer" }
+
+// 固定返回指定peer
+type stubPicker struct {
+	g PeerGetter
+}
+
+func (s stubPicker) PickPeer(string) (PeerGetter, bool) {
+	return s.g, s.g != nil
+}
+
+// TestHTTPGetterReturnsPeerHTTPError 验证非 200 响应映射为带状态码的类型化错误。
+func TestHTTPGetterReturnsPeerHTTPError(t *testing.T) {
+	tests := []struct {
+		name     string
+		code     int
+		isConfig bool
+	}{
+		{"401 Unauthorized", http.StatusUnauthorized, true},
+		{"403 Forbidden", http.StatusForbidden, true},
+		{"404 Not Found", http.StatusNotFound, true},
+		{"500 Internal Server Error", http.StatusInternalServerError, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tt.code)
+			}))
+			defer srv.Close()
+
+			getter := newHTTPGetter(srv.URL+defaultBasePath, nil, "")
+			err := getter.Get(&pb.Request{Group: "g", Key: "k"}, &pb.Response{})
+
+			var peerErr *PeerHTTPError
+			if !errors.As(err, &peerErr) {
+				t.Fatalf("error = %v, want *PeerHTTPError", err)
+			}
+			if peerErr.StatusCode != tt.code {
+				t.Errorf("StatusCode = %d, want %d", peerErr.StatusCode, tt.code)
+			}
+			if got := peerErr.IsConfigError(); got != tt.isConfig {
+				t.Errorf("IsConfigError() = %v, want %v", got, tt.isConfig)
+			}
+		})
+	}
+}
+
+// TestHTTPGetterTransportErrorIsNotPeerHTTPError 网络错误不能被误分类为 PeerHTTPError，
+// 否则会被当成配置错误而不是降级本地。
+func TestHTTPGetterTransportErrorIsNotPeerHTTPError(t *testing.T) {
+	srv := httptest.NewServer(http.NotFoundHandler())
+	url := srv.URL + defaultBasePath
+	srv.Close() // 连接被拒绝
+
+	err := newHTTPGetter(url, nil, "").Get(&pb.Request{Group: "g", Key: "k"}, &pb.Response{})
+	if err == nil {
+		t.Fatal("expected transport error")
+	}
+	var peerErr *PeerHTTPError
+	if errors.As(err, &peerErr) {
+		t.Fatalf("transport error misclassified as PeerHTTPError: %v", err)
+	}
+}
+
+// TestServeHTTPHidesInternalError 验证 500 响应不泄露内部错误文本。
+func TestServeHTTPHidesInternalError(t *testing.T) {
+	const (
+		secret = "db-dsn=postgres://internal-secret"
+		group  = "test-http-hide-internal-error"
+	)
+	NewGroup(group, 1<<10, GetterFunc(func(string) ([]byte, error) {
+		return nil, errors.New(secret)
+	}))
+	srv := httptest.NewServer(NewHTTPPool("http://self"))
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + defaultBasePath + group + "/k")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", resp.StatusCode)
+	}
+	if strings.Contains(string(body), secret) {
+		t.Fatalf("response leaked internal error: %q", body)
+	}
+	if got := strings.TrimSpace(string(body)); got != "internal error" {
+		t.Fatalf("body = %q, want %q", got, "internal error")
+	}
+}
+
+// TestLoadSurfacesConfigError 配置错误(401/403/404)不会降级本地，不会调用本地 getter。
+func TestLoadSurfacesConfigError(t *testing.T) {
+	for _, code := range []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound} {
+		t.Run(http.StatusText(code), func(t *testing.T) {
+			var localCalls atomic.Int32
+			g := NewGroup(fmt.Sprintf("test_config_err_%d", code), 1<<10, GetterFunc(func(string) ([]byte, error) {
+				localCalls.Add(1)
+				return nil, errors.New("local")
+			}))
+			g.RegisterPeers(&stubPicker{g: &stubPeerGetter{err: &PeerHTTPError{StatusCode: code}}})
+
+			_, err := g.Get("key")
+			if !isPeerConfigError(err) {
+				t.Fatalf("expect config error, got %v", err)
+			}
+			if localCalls.Load() != 0 {
+				t.Error("local getter was called, config error should NOT fallback local")
+			}
+		})
+	}
+}
+
+// TestLoadFallsBackOnServerError 5xx 临时故障会降级本地。
+func TestLoadFallsBackOnServerError(t *testing.T) {
+	var localCalls atomic.Int32
+	g := NewGroup("test_5xx", 1<<10, GetterFunc(func(string) ([]byte, error) {
+		localCalls.Add(1)
+		return []byte("local_data"), nil
+	}))
+	g.RegisterPeers(&stubPicker{g: &stubPeerGetter{
+		err: &PeerHTTPError{StatusCode: http.StatusInternalServerError},
+	}})
+
+	val, err := g.Get("key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(val.ByteSlice()) != "local_data" {
+		t.Error("should load from local")
+	}
+	if localCalls.Load() != 1 {
+		t.Errorf("local getter calls = %d, want 1", localCalls.Load())
+	}
+}
+
+// TestConfigErrorDoesNotTripBreaker 连续多次配置错误不会打开熔断器。
+func TestConfigErrorDoesNotTripBreaker(t *testing.T) {
+	peer := &stubPeerGetter{err: &PeerHTTPError{StatusCode: http.StatusUnauthorized}}
+	g := NewGroup("test_breaker", 1<<10, GetterFunc(func(string) ([]byte, error) {
+		return nil, nil
+	}))
+	g.RegisterPeers(&stubPicker{g: peer})
+
+	for i := 0; i < 4; i++ {
+		if _, err := g.Get(fmt.Sprintf("key-%d", i)); !isPeerConfigError(err) {
+			t.Fatalf("iteration %d: expect config error, got %v", i, err)
+		}
+	}
+	if got := peer.calls.Load(); got != 4 {
+		t.Fatalf("peer calls = %d, want 4 (breaker must stay closed)", got)
+	}
+}
+
+// TestConfigErrorReleasesHalfOpenProbe 验证配置错误会释放 HalfOpen 的唯一探测名额。
+// 如果不释放，熔断器会永久卡在半开状态，之后的请求全部静默降级。
+func TestConfigErrorReleasesHalfOpenProbe(t *testing.T) {
+	peer := &stubPeerGetter{err: &PeerHTTPError{StatusCode: http.StatusInternalServerError}}
+	g := NewGroup("test_half_open", 1<<10, GetterFunc(func(string) ([]byte, error) {
+		return []byte("local"), nil
+	}))
+	g.RegisterPeers(&stubPicker{g: peer})
+	g.breaker = NewCircuitBreaker(1, time.Millisecond)
+
+	// 第一次 5xx → 熔断器打开。
+	if _, err := g.Get("k1"); err != nil {
+		t.Fatalf("5xx should fall back to local: %v", err)
+	}
+
+	time.Sleep(5 * time.Millisecond) // 等待冷却期结束，进入 HalfOpen
+
+	// 半开探测拿到 401（配置错误）：错误必须暴露，探测名额必须释放。
+	peer.err = &PeerHTTPError{StatusCode: http.StatusUnauthorized}
+	if _, err := g.Get("k2"); !isPeerConfigError(err) {
+		t.Fatalf("want config error from half-open probe, got %v", err)
+	}
+
+	// 第三次请求必须能再次访问 peer；否则说明探测名额泄漏，被 ErrCircuitOpen 短路。
+	peer.err = nil
+	if _, err := g.Get("k3"); err != nil {
+		t.Fatalf("breaker stuck after config-error probe: %v", err)
+	}
+	if got := peer.calls.Load(); got != 3 {
+		t.Fatalf("peer calls = %d, want 3 (half-open probe slot leaked)", got)
+	}
+}
 
 func TestNewGroupRejectsNegativeCacheBytes(t *testing.T) {
 	const name = "negative-cache-bytes"
