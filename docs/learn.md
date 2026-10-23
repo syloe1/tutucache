@@ -245,13 +245,14 @@ Group 是整个系统的**核心编排层**。它：
 
 ```go
 type Group struct {
-    name      string          // 命名空间，如 "scores"
-    getter    Getter          // 缓存未命中时的回调：去哪加载原始数据
-    mainCache cache           // 本地 LRU 缓存
-    peers     PeerPicker      // 节点选择器（一致性哈希）
+    groupMu   sync.RWMutex         // 保护 peers 与 defaultTTL 的并发读写
+    name      string               // 命名空间，如 "scores"
+    getter    Getter               // 缓存未命中时的回调：去哪加载原始数据
+    mainCache cache                // 本地 LRU 缓存
+    peers     PeerPicker           // 节点选择器（一致性哈希）
     loader    *singleflight.Group  // 合并并发请求
-    DefaultTTL time.Duration      // ★ 默认过期时间，0 表示永不过期
-    breaker   *CircuitBreaker     // ★ 远程节点熔断器
+    defaultTTL time.Duration       // ★ 默认过期时间，0 表示永不过期
+    breaker   *CircuitBreaker      // ★ 远程节点熔断器
 }
 ```
 
@@ -328,10 +329,19 @@ getLocal(key):
 // SetTTL 设置默认过期时间并启动后台清理
 // cleanupInterval 为 0 时不启动后台清理（仅依赖 Get 时的惰性删除）
 func (g *Group) SetTTL(ttl time.Duration, cleanupInterval time.Duration) {
-    g.DefaultTTL = ttl
+    g.groupMu.Lock()
+    g.defaultTTL = ttl
+    g.groupMu.Unlock()
     if cleanupInterval > 0 {
         g.mainCache.StartCleanup(cleanupInterval)
     }
+}
+
+// TTL 返回当前默认过期时间；读取同样走锁，避免与 SetTTL 竞争。
+func (g *Group) TTL() time.Duration {
+    g.groupMu.RLock()
+    defer g.groupMu.RUnlock()
+    return g.defaultTTL
 }
 ```
 

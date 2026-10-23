@@ -545,3 +545,137 @@ func TestGetterCanLoadOtherKey(t *testing.T) {
 		t.Fatalf("Get(A) = %q, want %q", got, "A:B")
 	}
 }
+
+// TestGroupRegisterPeersConcurrentWithLoad 回归 #5：
+// RegisterPeers 的写与 load 的读之间必须存在 happens-before。
+// 数据竞争只在 go test -race 下能被捕获。
+func TestGroupRegisterPeersConcurrentWithLoad(t *testing.T) {
+	const (
+		readers       = 8
+		keysPerReader = 500
+	)
+	g := NewGroup("register-peers-race", 1<<20, GetterFunc(func(k string) ([]byte, error) {
+		return []byte(k), nil
+	}))
+	picker := stubPicker{g: &stubPeerGetter{}}
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		g.RegisterPeers(picker)
+	}()
+
+	for i := 0; i < readers; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			<-start
+			for j := 0; j < keysPerReader; j++ {
+				if _, err := g.Get(fmt.Sprintf("race-%d-%d", id, j)); err != nil {
+					t.Errorf("Get: %v", err)
+					return
+				}
+			}
+		}(i)
+	}
+
+	close(start)
+	wg.Wait()
+}
+
+// TestGroupRegisterPeersConcurrentDuplicatePanicsOnce 回归 #5 的非原子重复注册检查：
+// 并发重复注册时恰好一次成功，其余全部 panic，不会出现静默覆盖。
+func TestGroupRegisterPeersConcurrentDuplicatePanicsOnce(t *testing.T) {
+	const workers = 16
+	g := NewGroup("register-peers-duplicate", 1<<20, GetterFunc(func(k string) ([]byte, error) {
+		return []byte(k), nil
+	}))
+
+	start := make(chan struct{})
+	var (
+		ok       atomic.Int32
+		panicked atomic.Int32
+		wg       sync.WaitGroup
+	)
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			defer wg.Done()
+			defer func() {
+				if recover() != nil {
+					panicked.Add(1)
+				}
+			}()
+			<-start
+			g.RegisterPeers(stubPicker{g: &stubPeerGetter{}})
+			ok.Add(1)
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if got := ok.Load(); got != 1 {
+		t.Fatalf("successful registrations = %d, want 1", got)
+	}
+	if got := panicked.Load(); got != workers-1 {
+		t.Fatalf("panics = %d, want %d", got, workers-1)
+	}
+}
+
+// TestGroupSetTTLConcurrentWithGet 回归 #6：SetTTL 与 cache miss 触发的 populateCache 无竞争
+func TestGroupSetTTLConcurrentWithGet(t *testing.T) {
+	g := NewGroup("set-ttl-race", 1<<20, GetterFunc(func(k string) ([]byte, error) {
+		return []byte(k), nil
+	}))
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+
+	// 写端：并发修改 TTL
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := 0; i < 1000; i++ {
+			g.SetTTL(time.Duration(i)*time.Second, 0)
+		}
+	}()
+
+	// 读端：并发 Get 触发 cache miss + populateCache
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			<-start
+			for j := 0; j < 200; j++ {
+				key := fmt.Sprintf("ttl-race-%d-%d", id, j)
+				if _, err := g.Get(key); err != nil {
+					t.Errorf("Get: %v", err)
+					return
+				}
+			}
+		}(i)
+	}
+
+	close(start)
+	wg.Wait()
+}
+
+// TestGroupTTL 验证默认 TTL 的读写访问器：
+// 初始值为 0（永不过期），SetTTL 后 TTL 返回新值。
+func TestGroupTTL(t *testing.T) {
+	g := NewGroup("ttl-accessor", 1<<20, GetterFunc(func(k string) ([]byte, error) {
+		return []byte(k), nil
+	}))
+	if got := g.TTL(); got != 0 {
+		t.Fatalf("initial TTL = %v, want 0", got)
+	}
+	g.SetTTL(2*time.Minute, 0)
+	if got := g.TTL(); got != 2*time.Minute {
+		t.Fatalf("TTL after SetTTL = %v, want 2m", got)
+	}
+}

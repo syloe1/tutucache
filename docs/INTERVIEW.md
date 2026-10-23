@@ -325,14 +325,14 @@ StateClosed ──连续失败≥阈值──▶ StateOpen ──冷却超时─
 
 ### 1.10 Group — 上层编排（把上面全串起来）
 
-**怎么实现**（`geecache.go`）：`Group` 持 `name / getter / mainCache / peers / loader / DefaultTTL / breaker`。`Getter` 接口 `Get(key) ([]byte, error)` 是业务回源回调，`GetterFunc` 让普通函数适配成 Getter。
+**怎么实现**（`geecache.go`）：`Group` 持 `name / getter / mainCache / peers / loader / defaultTTL / breaker`，并用 `groupMu`（RWMutex）保护可变的 `peers` 与 `defaultTTL`。`Getter` 接口 `Get(key) ([]byte, error)` 是业务回源回调，`GetterFunc` 让普通函数适配成 Getter。
 
 - `NewGroup`：nil getter panic；注册进全局 `groups` map（RWMutex 保护）；熔断器固定 `NewCircuitBreaker(3, 10s)`。
 - `Get(key)`：空 key 报错 → `mainCache.get` 命中（RecordHit）→ miss（RecordMiss）→ `load`。
 - `load(key)`：`loader.Do(key, fn)` 包住「远程取 → 失败降级 getLocal」，同 key 只执行一次。
 - `getFromPeer`：熔断判断 → 远程 `peer.Get` → 记录成功/失败。
 - `getLocal`：`getter.Get` 回源 → `cloneBytes` 深拷贝 → `populateCache` 写回。
-- `SetTTL(ttl, cleanupInterval)`：设 DefaultTTL，cleanupInterval > 0 时启动后台清理。
+- `SetTTL(ttl, cleanupInterval)`：加写锁更新 `defaultTTL`，cleanupInterval > 0 时启动后台清理；`TTL()` 在读锁内返回当前值。
 
 **为什么回调用接口 + 函数适配器**：让使用者（业务方）不用实现结构体，直接传一个闭包就能定义「怎么回源」，Go 惯用法。
 
