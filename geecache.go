@@ -45,6 +45,7 @@ type Group struct {
 	name      string
 	getter    Getter     // **找不到缓存的时候，去哪里加载原始数据**」，**不是用来读缓存的！**
 	mainCache cache      // 本机内存缓存， 读LRU缓存（之前带sync.Mutex封装的缓存层）
+	mu        sync.RWMutex
 	peers     PeerPicker //远程节点选择器
 	//用来合并并发请求
 	loader *singleflight.Group
@@ -67,6 +68,8 @@ func (g *Group) CacheBytes() int64 {
 }
 
 func (g *Group) RegisterPeers(peers PeerPicker) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
 	if g.peers != nil {
 		panic("RegisterPeerPicker called more than once")
 	}
@@ -136,10 +139,14 @@ func (g *Group) load(key string) (value ByteView, err error) {
 	// each key is only fetched once (either locally or remotely)
 	// regardless of the number of concurrent callers.
 	viewi, err := g.loader.Do(key, func() (interface{}, error) {
-		if g.peers != nil {
+		g.mu.RLock()
+		peers := g.peers
+		g.mu.RUnlock()
+
+		if peers != nil {
 			//用一致性hash挑选远程节点
 			//Peer拿到的是服务器，
-			if peer, ok := g.peers.PickPeer(key); ok {
+			if peer, ok := peers.PickPeer(key); ok {
 				//发起HTTP请求从远程节点获取数据
 				if value, err = g.getFromPeer(peer, key); err == nil {
 					return value, nil

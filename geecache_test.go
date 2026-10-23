@@ -545,3 +545,36 @@ func TestGetterCanLoadOtherKey(t *testing.T) {
 		t.Fatalf("Get(A) = %q, want %q", got, "A:B")
 	}
 }
+
+type dummyPeerPicker struct{}
+
+func (d *dummyPeerPicker) PickPeer(key string) (PeerGetter, bool) {
+	return nil, false
+}
+
+func TestRegisterPeersRace(t *testing.T) {
+	for iter := 0; iter < 100; iter++ {
+		g := NewGroup(fmt.Sprintf("race_group_%d", iter), 2<<10, GetterFunc(
+			func(key string) ([]byte, error) {
+				return []byte("value-" + key), nil
+			},
+		))
+
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			g.RegisterPeers(&dummyPeerPicker{})
+		}()
+
+		for i := 0; i < 10; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				_, _ = g.Get("Tom")
+			}()
+		}
+
+		wg.Wait()
+	}
+}
