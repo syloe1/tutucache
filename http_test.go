@@ -1,7 +1,10 @@
 package geecache
 
 import (
+	"fmt"
+	pb "geecache/geecachepb"
 	"net/http"
+	"net/http/httptest"
 	"sync/atomic"
 	"testing"
 )
@@ -97,6 +100,34 @@ func TestHTTPPoolSetClosesRemovedGetter(t *testing.T) {
 }
 
 // 即使节点集合不变，认证配置变化后也必须重建客户端，否则会一直使用旧 token。
+// 回归测试 #13：group/key 作为独立 path segment 编码，含空格、/、+、中文和
+// 字面 %xx 的 key 必须经完整 HTTP 往返后原样返回。
+// 每个 key 使用独立 group，避免某个 key 的错误结果被缓存后污染后续断言。
+func TestPeerHTTPKeyRoundTrip(t *testing.T) {
+	keys := []string{"plain", "a b", "a/b", "a+b", "你好", "a%2Fb", "a?b", "a#b"}
+	for i, key := range keys {
+		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
+			group := fmt.Sprintf("roundtrip-%d", i)
+			NewGroup(group, 1<<20, GetterFunc(func(k string) ([]byte, error) {
+				return []byte(k), nil
+			}))
+
+			pool := NewHTTPPool("http://self")
+			srv := httptest.NewServer(pool)
+			defer srv.Close()
+
+			getter := newHTTPGetter(srv.URL+defaultBasePath, nil, "")
+			out := &pb.Response{}
+			if err := getter.Get(&pb.Request{Group: group, Key: key}, out); err != nil {
+				t.Fatalf("get key %q: %v", key, err)
+			}
+			if got := string(out.Value); got != key {
+				t.Errorf("key %q round-tripped as %q", key, got)
+			}
+		})
+	}
+}
+
 func TestHTTPPoolSetRebuildsOnConfigChange(t *testing.T) {
 	p := NewHTTPPool("http://self")
 	p.Set("http://a")

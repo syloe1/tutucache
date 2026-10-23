@@ -147,20 +147,31 @@ func (p *HTTPPool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	//`basePath` 一般是 `/geecache/`，限定本 handler 只处理 `/geecache/` 开头的请求。
-	if !strings.HasPrefix(r.URL.Path, p.basePath) {
-		panic("HTTPPool serving unexpected path: " + r.URL.Path)
+	// 必须用 EscapedPath 而不是 Path：Path 已被整体解码，key 中的 %2F 会变成 "/"，
+	// 无法再与路径分隔符区分。正确做法是先按 "/" 切段，再逐段 PathUnescape。
+	escapedPath := r.URL.EscapedPath()
+	if !strings.HasPrefix(escapedPath, p.basePath) {
+		panic("HTTPPool serving unexpected path: " + escapedPath)
 	}
-	p.Log("%s %s", r.Method, r.URL.Path)
+	p.Log("%s %s", r.Method, escapedPath)
 	// 把前缀切掉
-	parts := strings.SplitN(r.URL.Path[len(p.basePath):], "/", 2)
+	parts := strings.SplitN(escapedPath[len(p.basePath):], "/", 2)
 	if len(parts) != 2 {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
 	//`p.basePath = "/geecache/"`
 	//收到请求路径：`/geecache/user/1000`
-	groupName := parts[0] //user
-	key := parts[1]       // 1000
+	groupName, err := url.PathUnescape(parts[0]) //user
+	if err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	key, err := url.PathUnescape(parts[1]) // 1000
+	if err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
 
 	group := GetGroup(groupName)
 	if group == nil {
@@ -333,9 +344,10 @@ func (h *httpGetter) Get(in *pb.Request, out *pb.Response) error {
 	u := fmt.Sprintf(
 		"%v%v/%v",
 		h.baseURL,
-		//对 group 名和 key 做 URL 转义编码
-		url.QueryEscape(in.GetGroup()),
-		url.QueryEscape(in.GetKey()),
+		// group 和 key 是独立的 path segment，必须用 PathEscape：
+		// QueryEscape 会把空格编码成 "+"，而服务端路径中的 "+" 是字面加号。
+		url.PathEscape(in.GetGroup()),
+		url.PathEscape(in.GetKey()),
 	)
 	// 构造Get请求
 	req, err := http.NewRequest("GET", u, nil)
