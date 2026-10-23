@@ -48,6 +48,14 @@ func New(maxBytes int64, onEvicted func(string, Value)) *Cache {
 	}
 }
 
+// Purge 清空所有缓存条目。调用方必须自行同步并发访问。
+// 手动清理不触发容量淘汰，因此不会调用 OnEvicted 回调。
+func (c *Cache) Purge() {
+	c.ll.Init()
+	c.cache = make(map[string]*list.Element)
+	c.nbytes = 0
+}
+
 // Get 根据key读取缓存
 // 惰性过期：命中时检查过期；已过期直接删除，返回ok=false
 func (c *Cache) Get(key string) (value Value, ok bool) {

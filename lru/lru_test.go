@@ -171,3 +171,35 @@ func TestAddUpdateExistKey(t *testing.T) {
 		t.Fatal("update value failed")
 	}
 }
+
+// 清空全部条目、不触发淘汰回调 OnEvicted
+/*
+- `OnEvicted`：LRU 的淘汰回调，只有**容量满了、淘汰旧 key**的时候才会触发；
+- Purge 是手动清空，不属于容量淘汰，**规定不能触发这个回调**（这是这个测试里非常关键的业务约定）。
+*/
+func TestPurge(t *testing.T) {
+	var evicted int
+	c := New(4, func(string, Value) { evicted++ })
+	c.Add("a", String("a"), 0)
+	c.Add("b", String("b"), 0)
+
+	c.Purge()
+
+	if c.Len() != 0 || c.Bytes() != 0 {
+		t.Fatalf("after Purge: len=%d bytes=%d, want 0/0", c.Len(), c.Bytes())
+	}
+	if _, ok := c.Get("a"); ok {
+		t.Fatal("Purge left entry a in the cache")
+	}
+	if evicted != 0 {
+		t.Fatalf("Purge invoked OnEvicted %d times, want 0", evicted)
+	}
+
+	// Purge 不能丢掉 OnEvicted：之后的正常容量淘汰仍应触发回调。
+	c.Add("c", String("c"), 0)
+	c.Add("d", String("d"), 0)
+	c.Add("e", String("e"), 0)
+	if evicted == 0 {
+		t.Fatal("OnEvicted was lost after Purge: capacity eviction did not invoke it")
+	}
+}

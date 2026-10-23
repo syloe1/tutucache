@@ -240,17 +240,32 @@ func (g *Group) TTL() time.Duration {
 	return g.defaultTTL
 }
 
-// SetTTL 设置默认过期时间并启动后台清理。
-// cleanupInterval > 0 时，首次调用会启动一个后台清理循环；重复调用只更新
-// defaultTTL，不会重复启动 goroutine，清理间隔以首次的非零值为准。
-// cleanupInterval 为 0 时不启动后台清理（仅依赖 Get 时的惰性删除）。
+// SetTTL 设置默认缓存过期时间，仅对此调用之后新写入的缓存条目生效。
+// 已存在于本地缓存中的条目保留其写入时固化的 expiresAt，不会随 TTL 变更自动重算过期时间。
+//
+// 运维切换 TTL 策略时，建议先调用 SetTTL 再调用 Purge：
+// 反过来 Purge → SetTTL 之间，如果有并发加载完成回填缓存，会读到旧 TTL，成为漏网条目。
+// 注意：二者不是原子操作，Purge 不会等待在途加载完成，严格一致性需要调用方自行协调。
+//
+// cleanupInterval > 0 时，首次调用会启动后台过期清理循环；重复调用只更新 defaultTTL，不会重复启动 goroutine。
+// cleanupInterval 为 0 时不启动后台清理，仅依赖 Get 时的惰性删除。
 func (g *Group) SetTTL(ttl time.Duration, cleanupInterval time.Duration) {
 	g.groupMu.Lock()
 	g.defaultTTL = ttl
 	g.groupMu.Unlock()
+
 	if cleanupInterval > 0 {
 		g.mainCache.StartCleanup(cleanupInterval)
 	}
+}
+
+// Purge 清空当前 Group 的全部本地缓存（包括未过期条目）。
+// 典型用法：切换 TTL 策略后配合 SetTTL 清理旧条目，或需要让整组缓存立即失效。
+// 仅影响本机本地缓存层，不会清空远程节点上的缓存。
+// 注意：与在途并发加载不是原子操作——Purge 执行后，已经在进行的加载完成时仍会回填缓存，
+// 因此不保证 Purge 返回时缓存绝对为空。手动清理也不会计入 eviction 指标。
+func (g *Group) Purge() {
+	g.mainCache.purge()
 }
 
 // Close 停止 Group 的后台过期清理循环；可重复调用。

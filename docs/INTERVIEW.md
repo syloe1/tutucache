@@ -332,7 +332,7 @@ StateClosed ──连续失败≥阈值──▶ StateOpen ──冷却超时─
 - `load(key)`：`loader.Do(key, fn)` 包住「远程取 → 失败降级 getLocal」，同 key 只执行一次。
 - `getFromPeer`：熔断判断 → 远程 `peer.Get` → 记录成功/失败。
 - `getLocal`：`getter.Get` 回源 → `cloneBytes` 深拷贝 → `populateCache` 写回。
-- `SetTTL(ttl, cleanupInterval)`：加写锁更新 `defaultTTL`，cleanupInterval > 0 时启动后台清理；`TTL()` 在读锁内返回当前值。
+- `SetTTL(ttl, cleanupInterval)`：加写锁更新 `defaultTTL`，只对之后写入的条目生效；cleanupInterval > 0 时启动后台清理。`TTL()` 在读锁内返回当前值；切换 TTL 时可用 `Purge()` 清空本机旧条目。
 
 **为什么回调用接口 + 函数适配器**：让使用者（业务方）不用实现结构体，直接传一个闭包就能定义「怎么回源」，Go 惯用法。
 

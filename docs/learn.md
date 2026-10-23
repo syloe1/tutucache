@@ -326,8 +326,9 @@ getLocal(key):
 ### 5.6 设置 TTL
 
 ```go
-// SetTTL 设置默认过期时间并启动后台清理
-// cleanupInterval 为 0 时不启动后台清理（仅依赖 Get 时的惰性删除）
+// SetTTL 设置默认过期时间并启动后台清理。
+// 仅对调用之后新写入的条目生效：已有条目的 expiresAt 在写入时固化，不会自动重算。
+// cleanupInterval 为 0 时不启动后台清理（仅依赖 Get 时的惰性删除）。
 func (g *Group) SetTTL(ttl time.Duration, cleanupInterval time.Duration) {
     g.groupMu.Lock()
     g.defaultTTL = ttl
@@ -343,7 +344,15 @@ func (g *Group) TTL() time.Duration {
     defer g.groupMu.RUnlock()
     return g.defaultTTL
 }
+
+// Purge 清空本地全部缓存（包括未过期条目）。
+// 切换 TTL 策略时推荐先 SetTTL 再 Purge；两者非原子，Purge 不等待在途加载。
+func (g *Group) Purge() {
+    g.mainCache.purge()
+}
 ```
+
+`SetTTL` 是**前瞻生效**的：TTL 在 `lru.Add` 时被固化成每个条目的 `expiresAt`，所以修改默认 TTL 不会追溯已有条目。切换策略时如果需要让旧条目立即按新 TTL 失效，先调用 `SetTTL` 再调用 `Purge` 清空本机缓存（远端节点上的缓存不受影响）。
 
 ---
 

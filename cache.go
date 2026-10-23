@@ -23,6 +23,16 @@ type cache struct {
 	cleanupClosed bool
 }
 
+// purge 清空本地 LRU；尚未初始化时直接返回。
+func (c *cache) purge() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.lru == nil {
+		return
+	}
+	c.lru.Purge()
+}
+
 func (c *cache) add(key string, value ByteView, ttl time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
