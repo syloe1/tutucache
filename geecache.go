@@ -42,14 +42,15 @@ func (f GetterFunc) Get(key string) ([]byte, error) {
 
 // group是独立缓存命名空间
 type Group struct {
+	groupMu   sync.RWMutex // 保护 peers 与 defaultTTL 的并发读写
 	name      string
 	getter    Getter     // **找不到缓存的时候，去哪里加载原始数据**」，**不是用来读缓存的！**
 	mainCache cache      // 本机内存缓存， 读LRU缓存（之前带sync.Mutex封装的缓存层）
 	peers     PeerPicker //远程节点选择器
 	//用来合并并发请求
 	loader *singleflight.Group
-	// DefaultTTL 默认过期时间，0 表示永不过期
-	DefaultTTL time.Duration
+	// defaultTTL 默认过期时间，0 表示永不过期
+	defaultTTL time.Duration
 	// breaker 远程节点熔断器，失败 N 次后跳过远程直接降级到本地
 	breaker *CircuitBreaker
 	metrics *Metrics
@@ -66,7 +67,12 @@ func (g *Group) CacheBytes() int64 {
 	return g.mainCache.Bytes()
 }
 
+// RegisterPeers 设置远程节点选择器，每个 Group 只能注册一次。
+// 可以与 Get 并发调用：load 在读锁内取 peers 快照，注册前快照为 nil 的请求会走本地加载。
+// 重复注册会 panic；并发重复注册时，恰好只有一个 goroutine 注册成功，其余全部 panic。
 func (g *Group) RegisterPeers(peers PeerPicker) {
+	g.groupMu.Lock()
+	defer g.groupMu.Unlock()
 	if g.peers != nil {
 		panic("RegisterPeerPicker called more than once")
 	}
@@ -136,10 +142,14 @@ func (g *Group) load(key string) (value ByteView, err error) {
 	// each key is only fetched once (either locally or remotely)
 	// regardless of the number of concurrent callers.
 	viewi, err := g.loader.Do(key, func() (interface{}, error) {
-		if g.peers != nil {
+		// 在锁内取 peers 快照，锁外使用，避免持锁做网络 I/O
+		g.groupMu.RLock()
+		p := g.peers
+		g.groupMu.RUnlock()
+		if p != nil {
 			//用一致性hash挑选远程节点
 			//Peer拿到的是服务器，
-			if peer, ok := g.peers.PickPeer(key); ok {
+			if peer, ok := p.PickPeer(key); ok {
 				//发起HTTP请求从远程节点获取数据
 				if value, err = g.getFromPeer(peer, key); err == nil {
 					return value, nil
@@ -216,15 +226,28 @@ func (g *Group) getLocal(key string) (ByteView, error) {
 
 // 写入本地缓存
 func (g *Group) populateCache(key string, value ByteView) {
-	g.mainCache.add(key, value, g.DefaultTTL)
+	g.groupMu.RLock()
+	ttl := g.defaultTTL
+	g.groupMu.RUnlock()
+	g.mainCache.add(key, value, ttl)
+}
+
+// TTL 返回当前 Group 的默认缓存过期时间，0 表示永不过期。
+// 线程安全：与 SetTTL、Get 并发调用无数据竞争。
+func (g *Group) TTL() time.Duration {
+	g.groupMu.RLock()
+	defer g.groupMu.RUnlock()
+	return g.defaultTTL
 }
 
 // SetTTL 设置默认过期时间并启动后台清理。
 // cleanupInterval > 0 时，首次调用会启动一个后台清理循环；重复调用只更新
-// DefaultTTL，不会重复启动 goroutine，清理间隔以首次的非零值为准。
+// defaultTTL，不会重复启动 goroutine，清理间隔以首次的非零值为准。
 // cleanupInterval 为 0 时不启动后台清理（仅依赖 Get 时的惰性删除）。
 func (g *Group) SetTTL(ttl time.Duration, cleanupInterval time.Duration) {
-	g.DefaultTTL = ttl
+	g.groupMu.Lock()
+	g.defaultTTL = ttl
+	g.groupMu.Unlock()
 	if cleanupInterval > 0 {
 		g.mainCache.StartCleanup(cleanupInterval)
 	}
@@ -236,5 +259,3 @@ func (g *Group) SetTTL(ttl time.Duration, cleanupInterval time.Duration) {
 func (g *Group) Close() {
 	g.mainCache.StopCleanup()
 }
-
-//cc
