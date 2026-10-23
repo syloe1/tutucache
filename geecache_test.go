@@ -679,3 +679,80 @@ func TestGroupTTL(t *testing.T) {
 		t.Fatalf("TTL after SetTTL = %v, want 2m", got)
 	}
 }
+
+// TestGroupPurgeBeforeAnyAdd 空缓存调用Purge不能panic
+func TestGroupPurgeBeforeAnyAdd(t *testing.T) {
+	g := NewGroup("purge-empty", 1<<10, GetterFunc(func(k string) ([]byte, error) {
+		return []byte(k), nil
+	}))
+	g.Purge() // c.lru 尚未初始化，不能 panic
+
+	if got := g.CacheBytes(); got != 0 {
+		t.Fatalf("CacheBytes after empty Purge = %d, want 0", got)
+	}
+}
+
+// TestGroupSetTTLIsForwardLookingAndPurge 钉死前瞻语义
+func TestGroupSetTTLIsForwardLookingAndPurge(t *testing.T) {
+	g := NewGroup("ttl-forward-looking", 1<<20, GetterFunc(func(k string) ([]byte, error) {
+		return []byte("v-" + k), nil
+	}))
+
+	// 预热：旧条目在 defaultTTL == 0 时写入，永不过期。
+	if _, err := g.Get("old"); err != nil {
+		t.Fatal(err)
+	}
+
+	g.SetTTL(30*time.Millisecond, 0)
+	if _, err := g.Get("new"); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	if _, ok := g.mainCache.get("old"); !ok {
+		t.Fatal("old entry should keep its original zero expiry (forward-looking semantics)")
+	}
+	if _, ok := g.mainCache.get("new"); ok {
+		t.Fatal("new entry should expire under the new TTL")
+	}
+
+	// 先 SetTTL 再 Purge：重新加载的 old 应该使用新 TTL。
+	g.SetTTL(30*time.Millisecond, 0)
+	g.Purge()
+	if _, err := g.Get("old"); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if _, ok := g.mainCache.get("old"); ok {
+		t.Fatal("reloaded entry should expire under the new TTL after Purge")
+	}
+}
+
+// TestGroupPurgeConcurrentWithGet -race 下无数据竞争
+func TestGroupPurgeConcurrentWithGet(t *testing.T) {
+	g := NewGroup("purge-race", 1<<20, GetterFunc(func(k string) ([]byte, error) {
+		return []byte(k), nil
+	}))
+
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < 200; j++ {
+				if _, err := g.Get(fmt.Sprintf("purge-%d-%d", id, j)); err != nil {
+					t.Errorf("Get: %v", err)
+					return
+				}
+			}
+		}(i)
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 200; i++ {
+			g.Purge()
+		}
+	}()
+	wg.Wait()
+}
