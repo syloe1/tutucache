@@ -7,7 +7,6 @@ import (
 	"net"
 	"strconv"
 	"testing"
-	"time"
 
 	pb "geecache/geecachepb"
 
@@ -207,9 +206,8 @@ func TestGRPCPool_PickPeer_NoPeers(t *testing.T) {
 // =============================================================================
 
 func TestGRPCIntegration_FullRoundTrip(t *testing.T) {
-	// 1. 启动服务端（节点 8002，监听真实端口）
-	serverAddr := "localhost:18002"
-	serverPool := NewGRPCPool(serverAddr)
+	// 1. 在临时端口上启动服务端
+	_, serverAddr := startTestGRPCServerPool(t, nil)
 
 	// 创建带业务数据的 Group
 	NewGroup("scores-grpc", 1<<20, GetterFunc(
@@ -222,18 +220,10 @@ func TestGRPCIntegration_FullRoundTrip(t *testing.T) {
 		},
 	))
 
-	// 启动 gRPC server
-	go func() {
-		if err := serverPool.Serve(); err != nil {
-			t.Logf("server stopped: %v", err)
-		}
-	}()
-	defer serverPool.Stop()
-	time.Sleep(100 * time.Millisecond) // 等待 server 就绪
-
-	// 2. 启动客户端（节点 8001，把 8002 作为对端）
-	clientPool := NewGRPCPool("localhost:18001")
-	clientPool.Set("localhost:18001", "localhost:18002")
+	// 2. 启动客户端，只把服务端作为对端
+	clientPool := NewGRPCPool("127.0.0.1:1")
+	clientPool.Set(serverAddr)
+	defer clientPool.Stop()
 
 	// 3. 客户端通过 PickPeer 找到 server，发起 gRPC 请求
 	getter, ok := clientPool.PickPeer("Tom")
@@ -252,9 +242,12 @@ func TestGRPCIntegration_FullRoundTrip(t *testing.T) {
 }
 
 func TestGRPCIntegration_MultiNode(t *testing.T) {
-	// 启动 2 个真实 gRPC 服务
-	addrs := []string{"localhost:18003", "localhost:18004"}
+	// 启动 2 个临时端口的 gRPC 服务
 	pools := make([]*GRPCPool, 2)
+	addrs := make([]string, 2)
+	for i := range pools {
+		pools[i], addrs[i] = startTestGRPCServerPool(t, nil)
+	}
 
 	// 创建一个 Group，两个节点共享
 	NewGroup("shared", 1<<20, GetterFunc(
@@ -263,36 +256,24 @@ func TestGRPCIntegration_MultiNode(t *testing.T) {
 		},
 	))
 
-	for i, addr := range addrs {
-		pools[i] = NewGRPCPool(addr)
-		go func(idx int, a string) {
-			if err := pools[idx].Serve(); err != nil {
-				t.Logf("server %s stopped: %v", a, err)
-			}
-		}(i, addr)
-		defer pools[i].Stop()
-	}
-	time.Sleep(200 * time.Millisecond)
-
 	// 配置两个节点的拓扑
-	for i := range 2 {
+	for i := range pools {
 		pools[i].Set(addrs...)
 	}
 
-	// 从节点 0 发起请求，一致性哈希决定路由到哪个节点
-	// 多试几个 key 避免恰好哈希到 self
+	// 从节点 0 发起请求，一致性哈希决定路由到哪个节点。
+	// 临时端口的地址每次运行都不同，不能假设某几个固定 key 一定命中远端；
+	// 扫描足够多的 key，直到找到一个不属于 self 的节点。
 	var getter PeerGetter
-	var ok bool
 	testKey := ""
-	for _, k := range []string{"multi-key", "key-a", "key-b", "key-c", "key-d"} {
-		if g, found := pools[0].PickPeer(k); found && g != nil {
+	for i := 0; i < 1000 && getter == nil; i++ {
+		k := "multi-key-" + strconv.Itoa(i)
+		if g, ok := pools[0].PickPeer(k); ok && g != nil {
 			getter = g
-			ok = true
 			testKey = k
-			break
 		}
 	}
-	if !ok {
+	if getter == nil {
 		t.Fatal("expected to pick a peer, but all keys hashed to self")
 	}
 

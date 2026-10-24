@@ -15,6 +15,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"google.golang.org/grpc"
 )
 
 const (
@@ -234,21 +236,111 @@ func startAPIServer(listenAddr string, gee *geecache.Group, serveErr chan<- erro
 	return srv
 }
 
-// stopServers 在超时时间内关闭所有已启动的 HTTP 服务；nil 表示该服务未启动。
-func stopServers(apiSrv, cacheSrv *http.Server) {
+// stopServers 在超时时间内关闭所有已启动的 HTTP 服务；nil 会被跳过。
+// 前端 API、admin 与缓存节点共用一个关闭超时，避免串行等待导致总时长失控。
+func stopServers(servers ...*http.Server) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	if apiSrv != nil {
-		if err := apiSrv.Shutdown(ctx); err != nil {
-			log.Printf("API server shutdown warning: %v", err)
+	for _, srv := range servers {
+		if srv == nil {
+			continue
+		}
+		if err := srv.Shutdown(ctx); err != nil {
+			log.Printf("HTTP server shutdown warning: %v", err)
 		}
 	}
-	if cacheSrv != nil {
-		if err := cacheSrv.Shutdown(ctx); err != nil {
-			log.Printf("cache server shutdown warning: %v", err)
+}
+
+// parseTransport 校验 -transport 的取值。
+func parseTransport(v string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "http":
+		return "http", nil
+	case "grpc":
+		return "grpc", nil
+	default:
+		return "", fmt.Errorf("unsupported transport %q (use http or grpc)", v)
+	}
+}
+
+// startGRPCCacheServer 启动**集群内部 gRPC 节点服务**。
+// selfAddr 是对外公布的裸 host:port（gRPC target 不接受 URL scheme），
+// listenAddr 是本机监听的 host:port，测试中可以是 127.0.0.1:0。
+func startGRPCCacheServer(selfAddr, listenAddr string, gee *geecache.Group, tlsCfg tlsSettings, serveErr chan<- error) (*geecache.GRPCPool, *geecache.FileDiscovery, error) {
+	if _, _, err := net.SplitHostPort(selfAddr); err != nil {
+		return nil, nil, fmt.Errorf("invalid gRPC self address %q (want host:port): %w", selfAddr, err)
+	}
+
+	pool := geecache.NewGRPCPool(selfAddr)
+
+	if token := os.Getenv("GEECACHE_TOKEN"); token != "" {
+		pool.SetSharedToken(token)
+		log.Println("shared token auth enabled")
+	}
+
+	if tlsCfg.enabled {
+		if err := pool.EnableTLS(tlsCfg.certFile, tlsCfg.keyFile, tlsCfg.caFile); err != nil {
+			return nil, nil, fmt.Errorf("enable TLS: %w", err)
+		}
+		if tlsCfg.caFile != "" {
+			log.Println("TLS enabled with mTLS (client certificates required and verified)")
+		} else {
+			log.Println("TLS enabled")
 		}
 	}
+
+	// 先同步绑定端口，避免注册成功后才发现端口不可用。
+	ln, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		return nil, nil, fmt.Errorf("listen on %s: %w", listenAddr, err)
+	}
+
+	// gRPC 的节点地址是裸 host:port，不能与 HTTP 节点混用 peers.json。
+	discovery := geecache.NewFileDiscovery(selfAddr, peersFile)
+	if err := pool.StartDiscovery(discovery); err != nil {
+		_ = ln.Close()
+		return nil, nil, fmt.Errorf("register with discovery: %w", err)
+	}
+	gee.RegisterPeers(pool)
+
+	go func() {
+		log.Printf("geecache gRPC server is running at %s", listenAddr)
+		if err := pool.ServeListener(ln); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
+			serveErr <- fmt.Errorf("geecache gRPC server: %w", err)
+			return
+		}
+		log.Printf("geecache gRPC server %s stopped", listenAddr)
+	}()
+
+	return pool, discovery, nil
+}
+
+// startAdminServer 在独立端口上提供 /health 与 /metrics。
+// gRPC 模式没有 HTTP 节点 handler，健康检查和指标需要这个入口。
+func startAdminServer(listenAddr string, serveErr chan<- error) (*http.Server, error) {
+	mux := http.NewServeMux()
+	mux.Handle("/health", geecache.HealthHandler())
+	mux.Handle("/metrics", geecache.MetricsHandler())
+
+	srv := newHTTPServer(mux)
+	// 同步绑定，端口冲突作为启动错误返回。
+	ln, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		return nil, fmt.Errorf("listen on %s: %w", listenAddr, err)
+	}
+	srv.Addr = ln.Addr().String()
+
+	go func() {
+		log.Printf("admin server is running at %s", ln.Addr())
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serveErr <- fmt.Errorf("admin server: %w", err)
+			return
+		}
+		log.Printf("admin server stopped")
+	}()
+
+	return srv, nil
 }
 
 // run 封装所有启动、等待、关闭逻辑，返回值为进程退出时的错误（nil = 正常信号退出）。
@@ -256,9 +348,18 @@ func stopServers(apiSrv, cacheSrv *http.Server) {
 func run() error {
 	var port int
 	var api bool
+	var transport string
+	var adminAddr string
 	flag.IntVar(&port, "port", 8001, "Geecache server port")
 	flag.BoolVar(&api, "api", false, "Start a api server?")
+	flag.StringVar(&transport, "transport", "http", "peer transport: http or grpc")
+	flag.StringVar(&adminAddr, "admin-addr", "", "optional admin HTTP listen address for /health and /metrics (e.g. 127.0.0.1:9001)")
 	flag.Parse()
+
+	transport, err := parseTransport(transport)
+	if err != nil {
+		return err
+	}
 	/*
 
 	   # port=8001，api=false（不启动9999前端API）
@@ -280,28 +381,37 @@ func run() error {
 		return fmt.Errorf("unsupported port: %d (use 8001/8002/8003)", port)
 	}
 
-	// 解析并校验 TLS 环境变量，再用它决定节点注册/拨号使用的 scheme。
+	// 解析并校验 TLS 环境变量。HTTP 模式还需要用它决定注册 URL 的 scheme；
+	// gRPC 的 target 是裸 host:port，不携带 scheme。
 	tlsCfg, err := tlsSettingsFromEnv()
 	if err != nil {
 		return fmt.Errorf("invalid TLS configuration: %w", err)
 	}
-	scheme := "http"
-	if tlsCfg.enabled {
-		scheme = "https"
-	}
-	selfURL := fmt.Sprintf("%s://%s", scheme, hostAddr)
 
-	// 监听地址从对外 URL 中解析出来：与 scheme 无关，http/https 都监听同一个 host:port。
-	listenAddr, err := listenAddrFromURL(selfURL)
-	if err != nil {
-		return fmt.Errorf("invalid cache node address: %w", err)
+	var selfURL, listenAddr, registeredAddr string
+	if transport == "grpc" {
+		// 服务发现中登记裸地址；监听同一地址。
+		registeredAddr = hostAddr
+		listenAddr = hostAddr
+	} else {
+		scheme := "http"
+		if tlsCfg.enabled {
+			scheme = "https"
+		}
+		selfURL = fmt.Sprintf("%s://%s", scheme, hostAddr)
+		// 监听地址从对外 URL 中解析出来：与 scheme 无关，http/https 都监听同一个 host:port。
+		listenAddr, err = listenAddrFromURL(selfURL)
+		if err != nil {
+			return fmt.Errorf("invalid cache node address: %w", err)
+		}
+		registeredAddr = selfURL
 	}
 
 	//创建缓存 Group 实例
 	gee := createGroup()
 
-	// 服务运行错误的上报通道；容量等于可能上报错误的 server 数量（cache + api）。
-	serveErr := make(chan error, 2)
+	// 服务运行错误的上报通道；容量等于可能上报错误的 server 数量（cache + api + admin）。
+	serveErr := make(chan error, 3)
 
 	// 启动服务
 	var apiSrv *http.Server
@@ -312,11 +422,32 @@ func run() error {
 		}
 		apiSrv = startAPIServer(apiListenAddr, gee, serveErr)
 	}
+
+	var adminSrv *http.Server
+	if adminAddr != "" {
+		adminSrv, err = startAdminServer(adminAddr, serveErr)
+		if err != nil {
+			// API 服务可能已经启动，先关闭再退出。
+			stopServers(apiSrv)
+			gee.Close()
+			return fmt.Errorf("start admin server: %w", err)
+		}
+	}
+
 	//启动**集群内部通信缓存节点服务**
-	cacheSrv, discovery, err := startCacheServer(selfURL, listenAddr, gee, tlsCfg, serveErr)
+	var (
+		cacheSrv  *http.Server
+		grpcPool  *geecache.GRPCPool
+		discovery *geecache.FileDiscovery
+	)
+	if transport == "grpc" {
+		grpcPool, discovery, err = startGRPCCacheServer(registeredAddr, listenAddr, gee, tlsCfg, serveErr)
+	} else {
+		cacheSrv, discovery, err = startCacheServer(selfURL, listenAddr, gee, tlsCfg, serveErr)
+	}
 	if err != nil {
-		// API 服务可能已经启动，先关闭再退出，避免端口和 goroutine 泄漏。
-		stopServers(apiSrv, nil)
+		// 其他服务可能已经启动，先关闭再退出，避免端口和 goroutine 泄漏。
+		stopServers(apiSrv, adminSrv)
 		gee.Close()
 		return fmt.Errorf("start cache server: %w", err)
 	}
@@ -336,10 +467,17 @@ func run() error {
 	}
 	// 先停止 Watch/心跳，再注销；否则心跳会把刚删除的节点重新写回。
 	discovery.Close()
-	if err := discovery.Unregister(selfURL); err != nil {
-		log.Printf("[WARN] failed to unregister %s: %v", selfURL, err)
+	if err := discovery.Unregister(registeredAddr); err != nil {
+		log.Printf("[WARN] failed to unregister %s: %v", registeredAddr, err)
 	}
-	stopServers(apiSrv, cacheSrv)
+	stopServers(apiSrv, adminSrv, cacheSrv)
+	if grpcPool != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		if err := grpcPool.Shutdown(ctx); err != nil {
+			log.Printf("gRPC server shutdown warning: %v", err)
+		}
+		cancel()
+	}
 	// 停止 Group 的后台清理循环（若通过 SetTTL 启动过）。
 	gee.Close()
 

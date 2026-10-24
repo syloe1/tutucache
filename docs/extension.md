@@ -31,59 +31,29 @@
 
 ### 1.1 gRPC 通信
 
-**现状：** proto 文件中已定义了 `service GroupCache`，但只用了 protobuf 序列化，通信仍是 HTTP。`go.mod` 中已引入 `google.golang.org/grpc`。
+**现状：** 已实现，且与 HTTP 传输对齐。`peers_grpc.go` 提供 `GRPCServer`、`grpcGetter` 与
+`GRPCPool`；示例二进制通过 `-transport=grpc` 使用，可用独立的 `-admin-addr` 端口暴露
+`/health` 与 `/metrics`。
 
-**为什么需要：** gRPC 比纯 HTTP 性能更好（HTTP/2 多路复用、二进制帧），且 proto 生成的 gRPC 接口提供了类型安全的调用方式。
+**能力清单：**
 
-**实现方案：**
+- `Set` / `PickPeer`：一致性哈希选节点，连接按 peer 复用；拓扑变化只增删差集。
+- `StartDiscovery(d)`：注册裸 `host:port` 并监听节点变更，与 `FileDiscovery` 直接兼容。
+- `SetSharedToken`：客户端/服务端各一个 unary interceptor，每次 RPC 读取当前 token；
+  metadata key 使用小写 `x-geecache-token`。认证失败返回 `Unauthenticated`，
+  `peererror.go` 将其归类为配置错误，不会静默降级到本地。
+- `EnableTLS`：与 HTTP 共用 `buildPeerTLSConfigs`（TLS 1.2、可选 mTLS）。
+  gRPC server 的凭据在 `grpc.NewServer` 时固定，因此只能在 `Serve`/`ServeListener` 之前设置；
+  客户端 TLS 变更会重建已有连接。
+- `Serve` / `ServeListener`：`ServeListener` 接受预绑定 listener，便于测试和自定义监听。
+- `Shutdown(ctx)` / `Stop()`：先 `GracefulStop`（不持锁），超时后强制 `Stop`，
+  最后在锁外关闭客户端连接。
 
-```go
-// peers_grpc.go — 新建文件
+**地址约定：** gRPC target 与哈希环统一使用裸 `host:port`；带 scheme 的 URL 会去掉
+scheme/path。HTTP 与 gRPC 节点不能混用同一个 `peers.json`。
 
-// gRPC 服务端
-type GRPCServer struct {
-    geecachepb.UnimplementedGroupCacheServer
-    self string
-}
-
-func (s *GRPCServer) Get(ctx context.Context, req *pb.Request) (*pb.Response, error) {
-    group := GetGroup(req.Group)
-    if group == nil {
-        return nil, status.Errorf(codes.NotFound, "group %s not found", req.Group)
-    }
-    view, err := group.Get(req.Key)
-    if err != nil {
-        return nil, status.Errorf(codes.Internal, "%v", err)
-    }
-    return &pb.Response{Value: view.ByteSlice()}, nil
-}
-
-// gRPC 客户端 — 实现 PeerGetter 接口
-type grpcGetter struct {
-    addr   string
-    client geecachepb.GroupCacheClient
-}
-
-func (g *grpcGetter) Get(in *pb.Request, out *pb.Response) error {
-    ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-    defer cancel()
-    resp, err := g.client.Get(ctx, in)
-    if err != nil {
-        return err
-    }
-    *out = *resp
-    return nil
-}
-
-// GRPCPool — 类似 HTTPPool，管理 gRPC 连接池
-type GRPCPool struct {
-    self     string
-    peers    *consistenthash.Map
-    getters  map[string]*grpcGetter  // 复用连接
-}
-```
-
-**扩展点：** 可抽象出 `Transport` 接口，支持 HTTP 和 gRPC 两种实现，通过配置切换：
+**剩余扩展点：** 可抽象出 `Transport` 接口（`Serve` + `PeerPicker`/`PeerGetter`），
+由工厂根据配置构造，替代 `cmd` 中的 if/else 分支：
 
 ```go
 type Transport interface {

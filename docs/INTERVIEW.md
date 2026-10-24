@@ -249,12 +249,14 @@ type PeerGetter interface {
 **gRPC 通道**（`peers_grpc.go`）：
 - `GRPCServer`：嵌入 `pb.UnimplementedGroupCacheServer`，`Get(ctx, req)` 里 `GetGroup(req.Group)` + `group.Get(req.Key)`，把结果塞 `pb.Response`。
 - `grpcGetter`：封装 `pb.GroupCacheClient`，把 gRPC 风格 `(ctx, in) → (*Resp, error)` 适配成 PeerGetter 的 `(in, out) → error`，2 秒超时，用 `proto.Merge` 拷贝（避免直接赋值触发 protobuf 内部 mutex 拷贝 panic）。
-- `GRPCPool`：`Set` 建哈希环（50 虚拟节点）+ 为每个非 self 对端 `grpc.NewClient` 建连接缓存；`PickPeer` 找节点取 getter；`Serve` 注册 service + listen；`Stop` 做 `GracefulStop`。
+- `GRPCPool`：`Set` 把 peer 归一化为裸 `host:port`、建哈希环（50 虚拟节点）并为每个非 self 对端 `grpc.NewClient` 建连接缓存；`PickPeer` 找节点取 getter；`StartDiscovery` 直接复用 `ServiceDiscovery`；`SetSharedToken` 通过客户端/服务端 unary interceptor 在**每次 RPC** 读取 token（无需重连）；`EnableTLS` 与 HTTP 共用 `buildPeerTLSConfigs`；`Serve`/`ServeListener` 惰性创建 server；`Shutdown(ctx)` 先 `GracefulStop`，超时后强制 `Stop`，再关闭客户端连接。
+- gRPC server 的 TLS 凭据在创建时固定，`EnableTLS` 只能在启动前调用；token 不受此限制。示例二进制用 `-transport=grpc` 选择 gRPC，并用独立的 `-admin-addr` 端口提供 `/health`、`/metrics`。
 
 **会被追问**：
-- 「HTTP 和 gRPC 你是怎么做到共存的？」—— 都实现 PeerPicker/PeerGetter，序列化统一 protobuf，上层无感知。
+- 「HTTP 和 gRPC 你是怎么做到共存的？」—— 都实现 PeerPicker/PeerGetter，序列化统一 protobuf，上层无感知；认证、TLS、服务发现、指标也走同一套配置语义。
 - 「为什么 2 秒超时？」—— 避免远程节点故障时请求无限挂起；配合熔断器快速失败。
-- 「TLS/token 是干什么的？」—— 节点间通信的加密（TLS/mTLS）和认证（共享 token），属于工程加固。
+- 「TLS/token 是干什么的？」—— 节点间通信的加密（TLS/mTLS）和认证（共享 token），属于工程加固。gRPC 的 token 放在 metadata（key 必须小写），认证失败返回 `Unauthenticated`，与 HTTP 的 401 一样被归类为配置错误。
+- 「gRPC 的地址格式和 HTTP 有什么不同？」—— gRPC target 是裸 `host:port`，不能带 `http://`；TLS 由 transport credentials 启用，而不是从 scheme 推导。两种传输不能共用同一个 `peers.json`。
 - 「`proto.Merge` 为什么要拷贝而不是 `*out = *resp`？」—— protobuf 生成的 struct 含内部 mutex，按值拷贝会触发 `go vet` 的 copylock 警告甚至运行时 panic，`proto.Merge` 是正确拷贝方式。这个细节能体现你踩过坑。
 
 **标准答法**：两套传输共用一套接口和 protobuf 序列化；HTTP 用标准库手写路由 + proto.Marshal，gRPC 用生成的 client/server stub + 连接池复用。
@@ -499,12 +501,12 @@ StateClosed ──连续失败≥阈值──▶ StateOpen ──冷却超时─
 
 > 这一部分是你的「护城河」：**主动说出你项目里不完美的地方 + 你准备怎么改**，比被面试官追问到墙角强一百倍。每个雷点给三件套：「面试官可能怎么问」→「诚实且加分的说法」→「要不要补、怎么补」。
 
-### 雷点 1（最高优先级）：简历写「Protobuf + gRPC」，但 main 跑的是 HTTP
+### 雷点 1（已修复）：简历写「Protobuf + gRPC」，但 main 跑的是 HTTP
 
-- **事实**：`cmd/main.go:36` 用 `NewHTTPPool`，demo 走 HTTP；`GRPCPool` 只在 `peers_grpc_test.go` 里接线跑通。protobuf 序列化是真的（HTTP 通道也在用 `pb.Request/Response`）。
+- **事实**：现在的 `cmd/main.go` 支持 `-transport=http|grpc`，gRPC 模式接入同一套 `FileDiscovery`、共享 token 与 TLS/mTLS，并通过独立的 `-admin-addr` 端口暴露 `/health`、`/metrics`。protobuf 序列化在两种通道上都真实使用（`pb.Request/Response`）。
 - **面试官可能问**：「你 demo 跑起来用的什么协议？」「gRPC 通道上线了吗？」
-- **诚实且加分的说法**：> 「我实现了 HTTP 和 gRPC 两种传输，通过 PeerPicker/PeerGetter 接口解耦，序列化统一用 protobuf。demo 主入口当前走 HTTP，gRPC 通道我写了完整的单测和 bufconn 集成测试覆盖。之所以能这么做，正是接口解耦的好处——切通道不改核心逻辑。」
-- **要不要补**：如果想让简历 bullet 100% 硬，可以把 main 切到 gRPC（给 `GRPCPool` 补 `StartDiscovery`、`startCacheServer` 换成 `NewGRPCPool`+`Serve()`）。**属于可选的代码增强，我可以帮你做**。不改代码的话，上面这个说法也完全站得住，且显得你理解双通道设计。
+- **诚实且加分的说法**：> 「我实现了 HTTP 和 gRPC 两种传输，通过 PeerPicker/PeerGetter 接口解耦，序列化统一用 protobuf。示例二进制用 `-transport` 选择通道，两种模式都接入了服务发现、token 认证和 TLS/mTLS。切换通道不需要改核心缓存逻辑，这正是接口解耦的价值。」
+- **实现细节**：gRPC 认证用 unary interceptor（每次 RPC 读取 token，支持热更新），TLS 与 HTTP 共用同一套证书配置构建；因为 gRPC server 的凭据创建后不可替换，`EnableTLS` 被限制在启动前调用。
 
 ### 雷点 2（已修复）：`cache_bytes` 曾恒为 0
 
@@ -527,16 +529,16 @@ StateClosed ──连续失败≥阈值──▶ StateOpen ──冷却超时─
 - **诚实说法**：> 「目前熔断器是 group 级别的，一个 group 共享一个 breaker，所以某个远端连续失败会影响到这个 group 的所有远程请求。对只有单一『远端』语义的 demo 够用，但多异构 peer 场景粒度偏粗，生产化应该改成 per-peer 粒度，每个对端独立熔断。」
 - **怎么补**：把 breaker 从 Group 移到 `PeerGetter` 级别（或 `map[peer]*CircuitBreaker`），每个对端独立计数。这是「熔断粒度」的经典设计权衡，讲出来很加分。
 
-### 雷点 5：`GRPCPool` 没有 `StartDiscovery`
+### 雷点 5（已修复）：`GRPCPool` 没有 `StartDiscovery`
 
-- **事实**：服务发现只接在 `HTTPPool` 上（`http.go:170-179`），`GRPCPool` 是静态 `Set` 拓扑。
+- **事实**：`GRPCPool.StartDiscovery` 已实现，与 `HTTPPool` 共用 `ServiceDiscovery` 接口：注册归一化后的裸 `host:port`，Watch 回调中调用 `Set`，按差集增删连接和哈希环。
 - **面试官可能问**：「gRPC 通道下节点变化怎么办？」
-- **诚实说法**：> 「服务发现目前只接在 HTTPPool 上，gRPC 通道是静态 Set 的。如果要把 gRPC 也做成动态拓扑，需要给 GRPCPool 也实现一个 StartDiscovery，复用同一个 ServiceDiscovery 接口，节点变化时重建连接和哈希环。」
-- **怎么补**：给 `GRPCPool` 加 `StartDiscovery`（参考 `HTTPPool.StartDiscovery`），节点变化时 `Set(peers...)` 重建 `grpc.NewClient` 连接和哈希环。和雷点 1 是同一件事的两面——都在「gRPC 半成品」这个主题下。
+- **可以说**：> 「gRPC 和 HTTP 共用同一个 ServiceDiscovery 接口，只是注册地址格式不同：HTTP 注册 URL，gRPC 注册裸 host:port。发现回调进来后走同一套增量 Set 逻辑，下线的 peer 连接会被关闭。」
+- **边界**：两种传输不能混用同一个 `peers.json`；gRPC 会把 URL 形式归一化为 host:port，但 HTTP 客户端无法解析裸地址，因此切换传输前需要清理节点文件。
 
 ### 汇总：一个「我主动交代的改进清单」话术
 
-> 「如果要把这个项目生产化，我列了几个明确的改进点：① 把 gRPC 通道接进主入口并补上服务发现，让双通道都真正可用；② 按 group 导出真实的 cache bytes，让内存占用可观测；③ 让后台 goroutine 纳入优雅关闭生命周期；④ 熔断器从 per-group 细化到 per-peer。这些我都有清晰的改法，只是 demo 阶段优先保核心链路正确。」
+> 「如果要把这个项目生产化，我列了几个明确的改进点：① 把 HTTP/gRPC 的选择抽象成 Transport 工厂，去掉 cmd 里的 if/else；② 让后台 goroutine 的生命周期进一步收敛到统一的 context；③ 按需增加批量操作和更细的指标。核心的 gRPC parity、cache bytes、优雅关闭和 per-peer 熔断都已经补齐。」
 
 这样一段话，比「我抄了个 geecache」高好几个段位——它证明你**理解了自己代码的边界**，这正是「能读代码」和「能设计系统」之间的那道坎。
 
