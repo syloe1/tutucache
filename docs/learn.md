@@ -256,9 +256,9 @@ type Group struct {
 }
 ```
 
-`NewGroup` 里固定初始化兜底熔断器 `NewCircuitBreaker(3, 10*time.Second)`（连续失败 3 次熔断、10 秒后尝试恢复）。
+`NewGroup` 里固定初始化兜底熔断器 `NewCircuitBreaker(3, 10*time.Second)`（30 秒窗口内失败 3 次熔断、10 秒后尝试恢复）。
 内置的 `httpGetter`/`grpcGetter` 实现 `PeerBreakerProvider`，按 **（Group, peer）** 各自持有熔断器：
-节点 A 的连续失败只会熔断发往 A 的请求，不会波及健康节点 B；节点下线时 getter 被丢弃，熔断状态随之回收。
+节点 A 的失败只会熔断发往 A 的请求，不会波及健康节点 B；节点下线或客户端重建时 getter 被丢弃，熔断状态随之回收。
 
 ### 5.3 Getter 接口 —— 函数式接口模式
 
@@ -314,7 +314,8 @@ fn 内部:
        - peer.Get(req, res) 远程请求
        - 成功 → RecordSuccess + RecordPeerLoad
        - 失败 → RecordFailure → 降级
-  ② 远程失败 / 本地 key → 降级到 getLocal
+  ② 临时远程故障 / 本地 key → 降级到 getLocal
+     （认证/配置错误向上返回，不降级）
   ↓
 getLocal(key):
   ① 调用 getter.Get(key)   ← 用户提供的回调，从 DB/文件加载
@@ -388,11 +389,11 @@ type PeerGetter interface {
 - **服务端** `ServeHTTP`：实现 `http.Handler`，接收其他节点的查询请求。URL 格式 `/_geecache/<group>/<key>`。收到请求后 `GetGroup` + `group.Get(key)` 走完整链路，结果 `proto.Marshal` 成 `pb.Response` 写回。其中 `/health`、`/metrics` 两个路径免鉴权。
 - **客户端** `httpGetter`：实现 `PeerGetter`，向其他节点发起 HTTP GET，读 body 后 `proto.Unmarshal` 到 `out`，内置 2 秒超时。
 
-**节点管理：** `Set(peers...)` 建一致性哈希环 + 为每个非 self 对端建 `httpGetter`；`PickPeer(key)` 用哈希环找节点，返回对应的 getter。
+**节点管理：** `Set(peers...)` 按差集增量更新一致性哈希环，并为每个非 self 对端维护 `httpGetter`；`PickPeer(key)` 用哈希环找节点，返回对应的 getter。`StartDiscovery(d)` 负责注册本节点并在节点列表变化时调用 `Set`。
 
-**安全加固（可选）：**
-- **Token 认证**：`SetSharedToken` + 请求头 `X-Geecache-Token` 校验，最简单内网认证。
-- **TLS / mTLS**：`EnableTLS(certFile, keyFile, caFile)`，`caFile` 非空时开启双向 mTLS。
+**安全加固：**
+- **Token 认证**：`SetSharedToken` + 请求头 `X-Geecache-Token` 校验，恒定时间比较（SHA-256 + `subtle.ConstantTimeCompare`），最简单内网认证。
+- **TLS / mTLS**：`EnableTLS(certFile, keyFile, caFile)`，`caFile` 非空时开启双向 mTLS；配置变更会立即应用到已有 getter。
 
 **编译期断言：**
 
@@ -405,9 +406,14 @@ var _ PeerGetter = (*httpGetter)(nil)
 
 - **服务端 `GRPCServer`**：嵌入 `pb.UnimplementedGroupCacheServer`，实现 `Get(ctx, req)` —— 远程节点收到请求后 `GetGroup(req.Group)` + `group.Get(req.Key)`，把结果塞进 `pb.Response` 返回。
 - **客户端 `grpcGetter`**：封装 `pb.GroupCacheClient`，把 gRPC 风格 `(ctx, in) → (*Resp, error)` 适配成 PeerGetter 的 `(in, out) → error`，2 秒超时。
-- **`GRPCPool`**：`Set` 建哈希环 + 为每个对端 `grpc.NewClient` 建连接缓存；`PickPeer` 找节点取 getter；`Serve` 注册 service + listen；`Stop` 做 `GracefulStop`。
+- **`GRPCPool`**：能力与 `HTTPPool` 对齐：
+  - `Set` 把 peer 归一化为裸 `host:port`，按差集增量更新哈希环，并为每个非 self 对端维护 `grpc.NewClient` 连接。
+  - `StartDiscovery` 注册裸地址并监听节点变化；`PickPeer` 从同一张环上选节点。
+  - `SetSharedToken` 通过客户端/服务端 unary interceptor 在每次 RPC 读取 token，轮换无需重连；认证失败返回 `Unauthenticated`，被归类为配置错误而不是普通远端故障。
+  - `EnableTLS` 与 HTTP 共用 `buildPeerTLSConfigs`；客户端变更会重建连接，而 gRPC server 的凭据在创建时固定，因此只能在 `Serve`/`ServeListener` 之前设置。
+  - `Serve`/`ServeListener` 惰性创建 server；`Shutdown(ctx)` 先 `GracefulStop`，超时后强制 `Stop`，等在途 handler 结束后再关闭客户端连接。
 
-**HTTP 与 gRPC 如何共存：** 两者都实现 `PeerPicker` / `PeerGetter`，序列化统一用 protobuf，所以核心 `Group` 层无需感知差异。当前 `cmd/main.go` 示例主入口走 HTTP，gRPC 通道在 `peers_grpc_test.go` 里通过 `bufconn` 内存连接 + 真实端口做了完整测试。
+**HTTP 与 gRPC 如何共存：** 两者都实现 `PeerPicker` / `PeerGetter`，序列化统一用 protobuf，所以核心 `Group` 层无需感知差异。示例二进制通过 `-transport=http|grpc` 选择通道，两者都接入服务发现、共享 token 与 TLS/mTLS；gRPC 模式用独立的 `-admin-addr` 端口暴露 `/health`、`/metrics`。两种传输不能共用同一个 `peers.json`：HTTP 注册 URL，gRPC 注册裸 `host:port`。
 
 ---
 
@@ -576,9 +582,10 @@ service GroupCache {
 
 ```go
 type ServiceDiscovery interface {
-    GetPeers() ([]string, error)   // 获取所有节点地址
-    Register(addr string) error    // 注册当前节点
-    Watch(onChange func([]string)) // 监听节点变更
+    GetPeers() ([]string, error)      // 获取所有节点地址
+    Register(addr string) error       // 注册当前节点
+    Unregister(addr string) error     // 注销当前节点
+    Watch(onChange func([]string))    // 监听节点变更
 }
 ```
 
@@ -586,22 +593,26 @@ type ServiceDiscovery interface {
 
 基于共享 JSON 文件 `peers.json`（无外部依赖，适合 demo）：
 
-- `Register`：读文件 → 去重 → 把自己 merge 进去 → 写回。
+- `Register`：跨进程文件锁 + 读文件 → 去重 → 把自己 merge 进去 → 原子替换；后台心跳会周期性重注册。
+- `Unregister`：从文件删除本节点；`Close` 停止轮询与心跳，并等待 goroutine 退出，可重复调用。
 - `Watch`：后台 goroutine 每 3 秒读一次文件，和上次列表对比，**变化时**回调 `onChange(peers)`；启动时先读一次并回调初始化。
+- 退出时必须先 `Close` 再 `Unregister`，否则心跳可能在注销后又把节点写回。
 
-### 10.4 节点变化如何驱动哈希环重建
+### 10.4 节点变化如何驱动哈希环更新
 
-`HTTPPool.StartDiscovery` 把两者接起来：
+`HTTPPool.StartDiscovery` 与 `GRPCPool.StartDiscovery` 把这个接口接起来：
 
 ```go
 func (p *HTTPPool) StartDiscovery(d ServiceDiscovery) error {
     if err := d.Register(p.self); err != nil { return err }
     d.Watch(func(peers []string) {
-        p.Set(peers...)   // 节点变化 → 重建哈希环 + 重建 httpGetters
+        p.Set(peers...)   // 节点变化 → 差集更新哈希环与 getter
     })
     return nil
 }
 ```
+
+两个 Pool 的 `Set` 都只增删差集：下线的 peer 连接被关闭，幸存的 getter 继续复用。区别是注册地址格式——HTTP 用 URL，gRPC 用裸 `host:port`，因此两种传输不能共用同一个 `peers.json`。
 
 **抽象的意义：** 只要实现 `ServiceDiscovery` 接口，就可以把文件发现替换成 etcd / consul / zookeeper 等，而不用改 `Pool` 的代码。
 
@@ -619,7 +630,7 @@ func (p *HTTPPool) StartDiscovery(d ServiceDiscovery) error {
 
 ```
 Closed（闭合，正常放行）
-   ↓ 连续失败达到阈值 N 次
+   ↓ 窗口内失败达到阈值 N 次
 Open（熔断打开，拒绝请求）
    ↓ 等待 timeout 时间到期
 HalfOpen（半开，只放行探测请求）
@@ -638,38 +649,46 @@ type CircuitBreaker struct {
     mu            sync.Mutex
     state         State  // Closed / Open / HalfOpen
     generation    uint64 // 每次状态迁移 +1
-    failureCount  int
-    failureThresh int           // 连续失败多少次 → 熔断
+    failureTimes  []time.Time   // 滑动窗口内的失败时间
+    failureThresh int           // 窗口内失败多少次 → 熔断
     timeout       time.Duration // 熔断多久后尝试恢复
-    lastFailure   time.Time
+    failureWindow time.Duration // 失败计数窗口（默认 30s）
+    openedAt      time.Time
     probeInFlight bool          // HalfOpen 探测名额是否已被占用
 }
 ```
 
 - **`Allow() (Ticket, bool)`**：Closed→放行并返回当前代 ticket；Open→若已过冷却期则原子地切到 HalfOpen、`generation++`、预约探测名额并放行当前请求，否则拒绝；HalfOpen→名额已占用，拒绝其他请求。**半开是惰性触发的**——有请求来且已过冷却期才切。
-- **`RecordSuccess(ticket)`**：先校验代数；Closed 下清零计数，HalfOpen 探测成功则切回 Closed 并释放名额。
-- **`RecordFailure(ticket)`**：先校验代数；Closed 下计数 +1，达到阈值切 Open；HalfOpen 探测失败则切回 Open 并重新计算冷却起点。失效 ticket 不计数、不修改 `lastFailure`。
+- **`RecordSuccess(ticket)`**：先校验代数；Closed 下清空窗口，HalfOpen 探测成功则切回 Closed 并释放名额。
+- **`RecordFailure(ticket)`**：先校验代数并丢弃窗口外的旧失败；窗口内达到阈值切 Open；HalfOpen 探测失败则切回 Open 并重新计算冷却起点。失效 ticket 不计数、不修改状态。
+- **`RecordNeutral(ticket)`**：对端可达但请求不可用（认证/配置错误、key 不存在）时只释放 HalfOpen 名额，不计失败，避免把正常未命中或配置错误误判为节点故障。
 
 ### 11.4 接入点：getFromPeer
 
 ```go
 func (g *Group) getFromPeer(peer PeerGetter, key string) (ByteView, error) {
-    ticket, ok := g.breaker.Allow()       // 熔断打开 → 拒绝
+    breaker := g.breakerFor(peer)         // 内置 getter → 按 (Group, peer) 隔离
+    ticket, ok := breaker.Allow()         // 熔断打开 → 拒绝
     if !ok {
         return ByteView{}, ErrCircuitOpen
     }
     req := &pb.Request{Group: g.name, Key: key}
     res := &pb.Response{}
     if err := peer.Get(req, res); err != nil {
-        g.breaker.RecordFailure(ticket)   // 远程失败 → 计数（携带准入代数）
+        switch {
+        case isPeerConfigError(err), isPeerKeyNotFound(err):
+            breaker.RecordNeutral(ticket) // 对端可达，不计失败
+        default:
+            breaker.RecordFailure(ticket) // 真实故障 → 计数
+        }
         return ByteView{}, err
     }
-    g.breaker.RecordSuccess(ticket)       // 成功 → 复位（携带准入代数）
-    return ByteView{b: res.Value}, nil
+    breaker.RecordSuccess(ticket)         // 成功 → 复位（携带准入代数）
+    return ByteView{b: cloneBytes(res.Value)}, nil
 }
 ```
 
-`getFromPeer` 返回错误后，上层 `load` 自动降级到 `getLocal` 回源。本项目阈值/冷却固定为 `(3, 10s)`。
+`getFromPeer` 返回真实故障后，上层 `load` 自动降级到 `getLocal` 回源；配置错误会向上返回，不降级。默认参数为窗口 30s、阈值 3、冷却 10s。
 
 ---
 
@@ -697,7 +716,7 @@ type Metrics struct {
 
 ### 12.2 健康检查
 
-`/health` 返回 `200 OK`，是最简存活探针（liveness），`run.sh` / `run.py` 用它轮询等节点就绪。
+`/health` 返回 `200 OK`，是最简存活探针（liveness），`run.sh` / `run.py` 用它轮询等 HTTP 节点就绪。HTTP 模式由节点 handler 直接提供；gRPC 模式没有节点 HTTP handler，需要通过 `-admin-addr` 启动独立管理端口（HTTP 模式也可使用）。
 
 ### 12.3 优雅关闭（`cmd/main.go`）
 
@@ -706,12 +725,24 @@ quit := make(chan os.Signal, 1)
 signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 <-quit                                   // 等退出信号
 
-ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-defer cancel()
-server.Shutdown(ctx)                     // 停收新连接，等现有请求完成
+// 1. 先停服务发现并注销，避免心跳把节点重新写回
+discovery.Close()
+discovery.Unregister(registeredAddr)
+
+// 2. HTTP 入口（API / admin / cache）共享 10s 超时
+stopServers(apiSrv, adminSrv, cacheSrv)
+
+// 3. gRPC 优雅停止：等待在途请求，超时后强制 Stop
+if grpcPool != nil {
+    ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+    defer cancel()
+    grpcPool.Shutdown(ctx)               // 返回后再关闭客户端连接
+}
+
+gee.Close()                              // 停止 TTL 清理循环
 ```
 
-`http.Server.Shutdown` 与 `Close` 的区别：Shutdown 优雅（等请求处理完，可配超时），Close 立即断开所有连接。goroutine 里的 `ListenAndServe` 把 `http.ErrServerClosed` 当正常退出路径。
+`http.Server.Shutdown` 与 `Close` 的区别：Shutdown 优雅（等请求处理完，可配超时），Close 立即断开所有连接。goroutine 里的 `ListenAndServe` 把 `http.ErrServerClosed` 当正常退出路径。gRPC 同理：`GracefulStop` 等待在途 RPC，超时后 `Stop` 强制终止；客户端连接必须等 `GracefulStop` 返回后再关闭，否则在途请求无法继续向其他节点转发。
 
 ---
 
@@ -741,9 +772,9 @@ server.Shutdown(ctx)                     // 停收新连接，等现有请求完
               │  一致性哈希: hash("Tom") → 在环上查 → 节点 :8002
               ▼
            getFromPeer(:8002, "Tom")
-              │  ① breaker.Allow() 拒绝？熔断则降级
+              │  ① breakerFor(peer).Allow() 拒绝？熔断则降级
               │  ② HTTP GET http://localhost:8002/_geecache/scores/Tom
-              │     （或 gRPC GroupCache.Get）
+              │     （或 gRPC GroupCache.Get，由 -transport 选择）
               ▼
          ┌──────────────────────────────────┐
          │  远程节点 :8002                    │
@@ -772,8 +803,8 @@ server.Shutdown(ctx)                     // 停收新连接，等现有请求完
 1. **请求可能被路由到任意节点** —— 一致性哈希决定了 key 的归属
 2. **数据会被缓存两层** —— 请求方节点和归属节点都会缓存
 3. **Singleflight 在 load 入口** —— 保护了"远程请求"和"本地加载"两个路径
-4. **远程失败自动降级** —— 远程挂了（或熔断）就本地加载，保证可用性
-5. **熔断保护** —— 远端连续失败 3 次后 10 秒内跳过远程，快速降级
+4. **临时故障自动降级** —— 远程挂了或熔断时本地加载，保证可用性；认证/配置错误则向上返回
+5. **熔断保护** —— 单个 peer 在 30 秒窗口内失败 3 次后熔断 10 秒，期间跳过该远端，快速降级
 
 ---
 

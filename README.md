@@ -12,14 +12,14 @@ tutucache 是一个分布式内存缓存库，适用于需要**高并发读取**
 - **一致性哈希**：虚拟节点 + 一致性哈希环，节点增减时最小化缓存迁移
 - **Singleflight 合并**：相同 key 的并发请求合并为一次调用，防止缓存击穿
 - **熔断降级**：三态熔断器（Closed/Open/HalfOpen），远程节点故障时快速失败并降级到本地回源
-- **服务发现**：`ServiceDiscovery` 接口 + 文件发现实现，动态更新节点列表、重建哈希环
+- **服务发现**：`ServiceDiscovery` 接口 + 文件发现实现，动态更新节点列表并增量更新哈希环与连接
 - **双传输 + Protobuf**：HTTP 与 gRPC 两种通道共用 `PeerPicker`/`PeerGetter` 接口，序列化统一 protobuf
 - **gRPC 能力对等**：gRPC 传输与 HTTP 一样支持共享 token、TLS/mTLS 与服务发现；示例二进制用 `-transport=grpc` 切换
 - **TLS / mTLS**：两种传输都支持节点间加密；配置 CA 后强制要求并校验客户端证书
 - **只读字节视图**：`ByteView` 确保缓存值不会被外部意外修改
 - **指标埋点**：按 Group 隔离的命中/未命中、本地/远程加载、淘汰计数，以及从 LRU 实时派生的内存占用 gauge（Prometheus 格式 `/metrics`，带 `group` 标签）
-- **健康检查**：`/health` 存活探针
-- **优雅关闭**：监听退出信号，`http.Server.Shutdown` 等待请求处理完成
+- **健康检查**：`/health` 存活探针；gRPC 模式通过独立管理端口暴露
+- **优雅关闭**：监听退出信号，停止服务发现、注销节点、等待 HTTP 请求完成、优雅停止 gRPC 服务并关闭连接与后台清理循环
 - **接口解耦**：通过 `PeerPicker` / `PeerGetter` / `ServiceDiscovery` 接口隔离节点发现、网络通信与拓扑来源
 
 ## 架构
@@ -138,6 +138,15 @@ curl "http://localhost:9999/api?key=Jack"
 
 **方式三：gRPC 传输**
 
+`cmd` 参数：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `-port` | `8001` | 节点端口，可选 `8001`/`8002`/`8003`（需与地址约定一致） |
+| `-api` | `false` | 是否启动 `:9999` 前端 API 服务 |
+| `-transport` | `http` | 节点间传输：`http` 或 `grpc` |
+| `-admin-addr` | 空（关闭） | 独立明文 HTTP 管理端口，提供 `/health` 与 `/metrics` |
+
 gRPC 节点对外公布的是裸 `host:port`（不带 `http://`）。切换传输前先删除旧的
 `peers.json`：HTTP 与 gRPC 节点不能混用，因为 HTTP 客户端无法解析裸地址。
 
@@ -191,6 +200,28 @@ http.ListenAndServe(":8001", pool)
 
 // 5. 获取缓存
 value, err := group.Get("user:123")
+```
+
+gRPC 模式把第 2、4 步换成 `GRPCPool`（节点地址使用裸 `host:port`）：
+
+```go
+pool := geecache.NewGRPCPool("localhost:8001")
+group.RegisterPeers(pool)
+
+// 静态拓扑也可以直接调用：
+// pool.Set("localhost:8001", "localhost:8002", "localhost:8003")
+
+// 或者接入服务发现（注册地址同样是裸 host:port）
+discovery := geecache.NewFileDiscovery("localhost:8001", "peers.json")
+if err := pool.StartDiscovery(discovery); err != nil {
+    log.Fatal(err)
+}
+defer discovery.Close()
+
+// 阻塞运行；生产代码应处理错误并接入退出信号，必要时调用 pool.Shutdown(ctx)
+if err := pool.Serve(); err != nil {
+    log.Fatal(err)
+}
 ```
 
 ## 核心 API

@@ -42,7 +42,7 @@
                           populateCache(key, value)     ← 写回本地 LRU
 ```
 
-**一句话版本**：`Get` 先查本地 LRU，miss 后经 singleflight 合并，用一致性哈希选远程节点去取；远程取不到（或熔断）就降级回源，回源后写回本地缓存。
+**一句话版本**：`Get` 先查本地 LRU，miss 后经 singleflight 合并，用一致性哈希选远程节点去取；临时故障或熔断时降级回源，正常未命中/配置错误则按原语义返回，回源后写回本地缓存。
 
 ### 0.2 模块地图（横向一句话）
 
@@ -58,7 +58,7 @@
 | 拓扑 | `ServiceDiscovery` | 节点列表动态维护 → 驱动哈希环重建 |
 | 保护 | `CircuitBreaker` | 三态熔断，快速失败降级回源 |
 | 可观测 | `metrics` + `/health` | 命中率等指标 + 存活探针 |
-| 工程化 | `graceful shutdown` | 信号监听 + http.Server.Shutdown |
+| 工程化 | `graceful shutdown` | 信号监听 + HTTP/gRPC 优雅停止 + 发现注销 |
 
 ### 0.3 两版自我介绍话术
 
@@ -242,14 +242,14 @@ type PeerGetter interface {
 ### 1.7 传输层：HTTPPool（http.go）与 GRPCPool（peers_grpc.go）
 
 **HTTP 通道**（`http.go`）：
-- `HTTPPool`：`self`（自己地址）、`basePath`（默认 `/_geecache/`）、`peers *consistenthash.Map`、`httpGetters map[string]*httpGetter`、可选 `tlsConfig` 和 `sharedToken`。
+- `HTTPPool`：`self`（自己地址）、`basePath`（默认 `/_geecache/`）、`peers *consistenthash.Map`、`httpGetters map[string]*httpGetter`、可选的 `serverTLSConfig` / `clientTLSConfig` 和 `sharedToken`；token/TLS 变更会重建 getter。
 - 服务端 `ServeHTTP`：路由 `/_geecache/<group>/<key>`；`/health`、`/metrics` 免鉴权；其余校验 `X-Geecache-Token`；从 path 解析 group/key，`GetGroup` + `group.Get(key)` 走完整链路，结果 `proto.Marshal` 成 `pb.Response` 写回。
 - 客户端 `httpGetter.Get`：拼 URL、GET、读 body、`proto.Unmarshal` 到 `out`，2 秒超时。
 
 **gRPC 通道**（`peers_grpc.go`）：
 - `GRPCServer`：嵌入 `pb.UnimplementedGroupCacheServer`，`Get(ctx, req)` 里 `GetGroup(req.Group)` + `group.Get(req.Key)`，把结果塞 `pb.Response`。
 - `grpcGetter`：封装 `pb.GroupCacheClient`，把 gRPC 风格 `(ctx, in) → (*Resp, error)` 适配成 PeerGetter 的 `(in, out) → error`，2 秒超时，用 `proto.Merge` 拷贝（避免直接赋值触发 protobuf 内部 mutex 拷贝 panic）。
-- `GRPCPool`：`Set` 把 peer 归一化为裸 `host:port`、建哈希环（50 虚拟节点）并为每个非 self 对端 `grpc.NewClient` 建连接缓存；`PickPeer` 找节点取 getter；`StartDiscovery` 直接复用 `ServiceDiscovery`；`SetSharedToken` 通过客户端/服务端 unary interceptor 在**每次 RPC** 读取 token（无需重连）；`EnableTLS` 与 HTTP 共用 `buildPeerTLSConfigs`；`Serve`/`ServeListener` 惰性创建 server；`Shutdown(ctx)` 先 `GracefulStop`，超时后强制 `Stop`，再关闭客户端连接。
+- `GRPCPool`：`Set` 把 peer 归一化为裸 `host:port`，按差集增量更新哈希环（50 虚拟节点），并为每个非 self 对端维护 `grpc.NewClient` 连接；`PickPeer` 找节点取 getter；`StartDiscovery` 复用 `ServiceDiscovery` 接口；`SetSharedToken` 通过客户端/服务端 unary interceptor 在**每次 RPC** 读取 token（无需重连）；`EnableTLS` 与 HTTP 共用 `buildPeerTLSConfigs`；`Serve`/`ServeListener` 惰性创建 server；`Shutdown(ctx)` 先 `GracefulStop`，超时后强制 `Stop`，再关闭客户端连接。
 - gRPC server 的 TLS 凭据在创建时固定，`EnableTLS` 只能在启动前调用；token 不受此限制。示例二进制用 `-transport=grpc` 选择 gRPC，并用独立的 `-admin-addr` 端口提供 `/health`、`/metrics`。
 
 **会被追问**：
@@ -266,11 +266,12 @@ type PeerGetter interface {
 ### 1.8 服务发现 ServiceDiscovery + FileDiscovery
 
 **怎么实现**：
-- 接口（`discovery.go:3-10`）：`GetPeers()` / `Register(addr)` / `Watch(onChange func([]string))`。
-- `FileDiscovery`（`filediscovery.go`）：基于共享 JSON 文件 `peers.json`（`["http://localhost:8001", ...]`），无外部依赖。
-  - `Register`：读文件 → map 去重 → 把自己 merge 进去 → 写回。
+- 接口（`discovery.go`）：`GetPeers()` / `Register(addr)` / `Unregister(addr)` / `Watch(onChange func([]string))`；`FileDiscovery` 另有 `Close()` 停止轮询与心跳。
+- `FileDiscovery`（`filediscovery.go`）：基于共享 JSON 文件 `peers.json`（HTTP 模式是 `["http://localhost:8001", ...]`，gRPC 模式是裸 `host:port`），无外部依赖。
+  - `Register`：跨进程文件锁 + 读文件 → map 去重 → 把自己 merge 进去 → 原子替换，并周期性重注册。
+  - `Unregister` / `Close`：退出时删除本节点并停止轮询/心跳；`cmd` 按「先 `Close` 再 `Unregister`」执行，避免心跳把节点重新写回。
   - `Watch`：后台 goroutine 每 3 秒 ticker 读一次文件，和上次列表做集合比较，**变化时**回调 `onChange(peers)`；启动时先读一次并回调初始化。
-- 节点列表如何更新到哈希环：`HTTPPool.StartDiscovery` 里 `d.Register(p.self)` + `d.Watch(func(peers){ p.Set(peers...) })`，`Set` 内部重建哈希环和 getter map。
+- 节点列表如何更新到哈希环：`HTTPPool` / `GRPCPool` 的 `StartDiscovery` 里 `d.Register(p.self)` + `d.Watch(func(peers){ p.Set(peers...) })`，`Set` 按差集增量更新哈希环和 getter map。
 
 **为什么这么设计**：
 - 抽象成 `ServiceDiscovery` 接口，就可以把「文件发现」替换成 etcd / consul / zookeeper 而不用改 `Pool`。这是接口解耦思想在拓扑层的复用。
@@ -278,9 +279,9 @@ type PeerGetter interface {
 
 **会被追问**：
 - 「文件轮询有什么问题？」—— 节点崩溃不会从文件里移除（没有心跳/lease），会有「幽灵节点」；3 秒才有感知，非实时。
-- 「为什么节点变化要重建整个哈希环而不是增量更新？」—— 简单正确优先；重建成本在节点规模小时可接受。
+- 「节点变化时哈希环和连接怎么更新？」—— 两个 Pool 都按差集增量更新：只删除下线节点、添加新增节点，并关闭下线 peer 的连接，幸存连接继续复用。
 
-**标准答法**：接口抽象拓扑来源，文件轮询做 demo 版实现，变化时回调驱动哈希环重建；生产可替换成 etcd/consul。
+**标准答法**：接口抽象拓扑来源，文件轮询做 demo 版实现，变化时回调驱动哈希环与连接增量更新；生产可替换成 etcd/consul。
 
 ---
 
@@ -289,7 +290,7 @@ type PeerGetter interface {
 **怎么实现**（`circuitbreaker.go`）：
 
 ```
-StateClosed ──连续失败≥阈值──▶ StateOpen ──冷却超时──▶ StateHalfOpen
+StateClosed ──窗口内失败≥阈值──▶ StateOpen ──冷却超时──▶ StateHalfOpen
     ▲                                                       │
     └────────────成功───────────────  ┌────失败（立刻重新 Open）
                                       │
@@ -297,20 +298,22 @@ StateClosed ──连续失败≥阈值──▶ StateOpen ──冷却超时─
 ```
 
 - 状态机三态：`Closed`（正常放行）、`Open`（熔断，快速失败）、`HalfOpen`（放行一个探测请求）。
-- `NewCircuitBreaker(3, 10*time.Second)`：**连续失败 3 次熔断，10 秒后尝试恢复**。
+- 默认参数：失败阈值 3、冷却 10 秒、失败计数滑动窗口 30 秒。窗口外的旧失败会被丢弃，零星慢失败不会累积到阈值。
+- 隔离粒度：内置 `httpGetter`/`grpcGetter` 实现 `PeerBreakerProvider`，按 **(Group, peer)** 各持一个熔断器；一个坏节点不会熔断其他健康节点。
 - `Allow() (Ticket, bool)`：
   - Closed → 放行，返回当前 generation 的 ticket。
   - Open → 若冷却已到，原子地切到 HalfOpen、`generation++` 并预约唯一探测名额，返回探测 ticket；否则拒绝。
   - HalfOpen → 探测名额已被占用，拒绝其他请求。
 - `RecordSuccess(ticket)` / `RecordFailure(ticket)`：
   - 先校验 `ticket.generation == 当前 generation`，不匹配（迟到的旧结果）直接返回，不修改任何状态。
-  - Closed 下成功清零计数、失败计数 +1，达到阈值切 Open。
+  - Closed 下成功清空窗口；失败先丢弃窗口外记录再 +1，达到阈值切 Open。
   - HalfOpen 下只有预约的探测结果有效：成功 → Closed，失败 → Open 并重新计算冷却起点。
+  - `RecordNeutral(ticket)`：对端可达但请求不可用（配置错误、key 不存在）时只释放半开探测名额，不计失败。
 - `generation`（状态代数，每次状态迁移 +1）和 `probeInFlight`（半开探测名额）是两个独立机制：前者丢弃跨代迟到结果，后者保证半开只放行一个探测。
 
 **半开是惰性触发的**：不是定时器主动切半开，而是「有请求来且已过冷却期」才切。半开只放一个探测，探测成功→Closed，探测失败→立刻重新 Open。
 
-**降级接入点**：在 `Group.getFromPeer`。`Allow()` 拒绝 → 返回 `ErrCircuitOpen` 快速失败，上层 `load` 落到 `getLocal` 回源。远程请求成功/失败分别用准入时拿到的 ticket 调用 `RecordSuccess`/`RecordFailure`。
+**降级接入点**：在 `Group.getFromPeer`，先通过 `breakerFor(peer)` 取当前 peer 在所属 Group 下的熔断器。`Allow()` 拒绝 → 返回 `ErrCircuitOpen` 快速失败，上层 `load` 落到 `getLocal` 回源。远程请求按结果类型用准入 ticket 调用 `RecordSuccess` / `RecordFailure` / `RecordNeutral`；配置错误会向上返回，不降级。
 
 **为什么这么设计**：
 - 熔断器解决「雪崩」：一个下游节点故障，如果还不断去请求，会让调用方大量 goroutine 阻塞等待超时，进而拖垮上游。熔断让故障节点快速失败、跳过远程直接本地回源。
@@ -318,7 +321,7 @@ StateClosed ──连续失败≥阈值──▶ StateOpen ──冷却超时─
 
 **会被追问**：
 - **「熔断 vs 限流 vs 降级」区别** —— 限流是「控制进入系统的流量」；熔断是「下游不可用时快速失败」；降级是「提供兜底方案」。本项目：熔断触发后，降级动作是「本地回源」。
-- **「你的熔断器是 per-group 还是 per-peer 粒度？」** —— 这是**主动加分点**（见 Part 4 雷点 4）：目前是 per-group，一个 group 一个 breaker，任一远端连续失败会熔断该 group 的所有远程。诚实说「demo 够用，生产要 per-peer」。
+- **「你的熔断器是 per-group 还是 per-peer 粒度？」** —— 按 **(Group, peer)** 隔离：每个内置 getter 持有按 Group 名索引的熔断器，坏节点只影响发往它的请求；getter 随拓扑移除而回收，状态无需额外清理。自定义 `PeerGetter` 未实现 `PeerBreakerProvider` 时退回 Group 级兜底。
 - 「阈值和冷却时间怎么定？」—— 阈值太敏感会误熔断，太迟钝起不到保护；冷却太短会反复抖动，太长影响可用性。实际靠压测调。
 
 **标准答法**：三态状态机 + 半开探测自动恢复，配合降级回源，解决雪崩。
@@ -329,10 +332,10 @@ StateClosed ──连续失败≥阈值──▶ StateOpen ──冷却超时─
 
 **怎么实现**（`geecache.go`）：`Group` 持 `name / getter / mainCache / peers / loader / defaultTTL / breaker`，并用 `groupMu`（RWMutex）保护可变的 `peers` 与 `defaultTTL`。`Getter` 接口 `Get(key) ([]byte, error)` 是业务回源回调，`GetterFunc` 让普通函数适配成 Getter。
 
-- `NewGroup`：nil getter panic；注册进全局 `groups` map（RWMutex 保护）；熔断器固定 `NewCircuitBreaker(3, 10s)`。
+- `NewGroup`：nil getter panic；注册进全局 `groups` map（RWMutex 保护）；同时创建 Group 级兜底熔断器（`3` 次阈值、`10s` 冷却、`30s` 窗口），供未实现 `PeerBreakerProvider` 的第三方 getter 使用。
 - `Get(key)`：空 key 报错 → `mainCache.get` 命中（RecordHit）→ miss（RecordMiss）→ `load`。
 - `load(key)`：`loader.Do(key, fn)` 包住「远程取 → 失败降级 getLocal」，同 key 只执行一次。
-- `getFromPeer`：熔断判断 → 远程 `peer.Get` → 记录成功/失败。
+- `getFromPeer`：按 peer 取熔断器 → 远程 `peer.Get` → 按结果记录成功/失败/中立，最后深拷贝响应并回填本地缓存。
 - `getLocal`：`getter.Get` 回源 → `cloneBytes` 深拷贝 → `populateCache` 写回。
 - `SetTTL(ttl, cleanupInterval)`：加写锁更新 `defaultTTL`，只对之后写入的条目生效；cleanupInterval > 0 时启动后台清理。`TTL()` 在读锁内返回当前值；切换 TTL 时可用 `Purge()` 清空本机旧条目。
 
@@ -355,19 +358,23 @@ StateClosed ──连续失败≥阈值──▶ StateOpen ──冷却超时─
 - `/metrics` 输出带 `group="..."` 标签的原始 `_total` 计数器；不导出 lifetime 命中率 gauge，近期命中率由 Prometheus 对计数器求 `rate()`。
 - 内存占用 `geecache_cache_bytes` 是 gauge：每次抓取时在 `cache.mu` 保护下读取 `lru.nbytes`（`lru.Bytes()` → `cache.Bytes()` → `Group.CacheBytes()`），按 group 输出；不额外维护 atomic 镜像，避免与真实状态漂移。
 
-**健康检查**：`/health` 返回 200 + "OK"，最简存活探针（liveness），免鉴权。
+**健康检查**：`/health` 返回 200 + "OK"，最简存活探针（liveness），免鉴权。HTTP 模式由节点 handler 提供；gRPC 模式通过 `-admin-addr` 启动独立管理端口，同时暴露 `/health` 和 `/metrics`。
 
-**优雅关闭**（`cmd/main.go:146-163`）：
+**优雅关闭**（`cmd/main.go`）：
 - `signal.Notify(quit, SIGINT, SIGTERM)` 监听退出信号。
-- `http.Server.Shutdown(ctx)`（10 秒超时）：先停止接受新连接，再等已建立连接的请求处理完。
-- goroutine 里 `ListenAndServe` 把 `http.ErrServerClosed` 当正常退出。
+- 先 `discovery.Close()` 停止轮询/心跳，再 `Unregister` 注销本节点，避免心跳把节点重新写回。
+- HTTP 入口（API、admin、cache）共享 10 秒超时调用 `Shutdown`：停止接受新连接，等待已建立连接的请求处理完。
+- gRPC 调用 `GRPCPool.Shutdown(ctx)`：`GracefulStop` 等待在途 RPC，超时后强制 `Stop`；等 `GracefulStop` 返回后再关闭客户端连接，保证在途 handler 仍能向其他节点转发。
+- `Group.Close()` 停止 TTL 后台清理循环。
+- goroutine 里 `ListenAndServe` 把 `http.ErrServerClosed` 当正常退出；`ServeListener` 把 `grpc.ErrServerStopped` 当正常退出。
 
 **会被追问**：
-- 「atomic 为什么比加锁好？」—— 计数场景原子操作更轻、无锁竞争；缺点是多个字段之间读不出「统一快照」（微弱不一致，监控场景可接受）。
+- 「多个字段的指标怎么保证一致？」—— `Metrics` 用 `sync.RWMutex`，`Snapshot` 一次拷完全部字段，得到同一时刻的一致视图；简单单计数器才适合 atomic。
 - 「Shutdown 和 Close 区别？」—— Shutdown 优雅（等请求处理完），Close 立即（粗暴断开）。这也是高频 Go 题。
 - 「health 是 liveness 还是 readiness？」—— 目前只有 liveness；生产还要 readiness（依赖检查）。
+- 「后台 goroutine 怎么退出？」—— `FileDiscovery.Close` 停止轮询/心跳，`Group.Close` 停止 TTL 清理；两者都接入了 cmd 的关闭顺序。
 
-**标准答法**：atomic 无锁计数 + Prometheus 暴露；/health 存活探针；signal + Shutdown 优雅退出。
+**标准答法**：按 Group 隔离的锁保护计数 + 一致快照，Prometheus 暴露；/health 存活探针；signal + 分阶段关闭（发现 → HTTP → gRPC → 后台清理）。
 
 ---
 
@@ -414,17 +421,17 @@ StateClosed ──连续失败≥阈值──▶ StateOpen ──冷却超时─
 
 ### 第 7 步：防雪崩（熔断降级）
 - 痛点：某个下游节点故障，若还不断请求，会让调用方大量 goroutine 阻塞等超时，拖垮上游，连锁反应。
-- 方案：**熔断器**——连续失败 N 次后熔断，快速失败；冷却期后放一个探测（半开），成功恢复，失败继续熔断。熔断后的**降级**动作是「跳过远程，本地回源」。
-- 取舍：粒度（per-group vs per-peer）、阈值、冷却时间都要调。
+- 方案：**熔断器**——时间窗口内失败 N 次后熔断，快速失败；冷却期后放一个探测（半开），成功恢复，失败继续熔断。熔断后的**降级**动作是「跳过远程，本地回源」。
+- 取舍：粒度选 **(Group, peer)**，避免一个坏节点影响其他节点；阈值、窗口、冷却时间按压测调。
 
 ### 第 8 步：可观测性（指标 + 健康检查）
 - 痛点：上线后看不到命中率、看不到哪一步是瓶颈、故障难定位。
 - 方案：埋点（hits/misses/local_loads/peer_loads/evictions）+ 命中率 + `/metrics`（Prometheus）+ `/health`。
-- 取舍：计数用 atomic 无锁，换「微弱不一致」换「无锁高性能」。
+- 取舍：多字段用 `RWMutex` 提供一致快照；单计数器才用 atomic。gRPC 模式没有节点 HTTP handler，需要独立 admin 端口暴露健康与指标。
 
 ### 第 9 步：工程化（优雅关闭）
-- 痛点：直接 kill 进程会丢正在处理的请求。
-- 方案：监听 SIGINT/SIGTERM → `http.Server.Shutdown` 等请求处理完再退，超时兜底。
+- 痛点：直接 kill 进程会丢正在处理的请求，节点也会残留在服务发现里。
+- 方案：监听 SIGINT/SIGTERM → 停止发现并注销 → `http.Server.Shutdown` 等 HTTP 请求 → `GRPCPool.Shutdown(ctx)` 等在途 RPC、超时强制停止 → 关闭后台清理。
 
 **一句话串联（面试万能开场）**：先单机 LRU+TTL 解决「存什么、存多久」，再一致性哈希解决「多机怎么分」，singleflight 防击穿、熔断降级防雪崩，最后补可观测和优雅关闭。每一步都是被一个具体痛点逼出来的。
 
@@ -460,7 +467,7 @@ StateClosed ──连续失败≥阈值──▶ StateOpen ──冷却超时─
 
 ### 熔断器
 **Q：熔断器状态机？**
-- Closed → Open（连续失败达阈值）→ HalfOpen（冷却期后放一个探测）→ Closed（成功）/ Open（失败）。
+- Closed → Open（窗口内失败达阈值）→ HalfOpen（冷却期后放一个探测）→ Closed（成功）/ Open（失败）；按 (Group, peer) 隔离。
 
 **Q：熔断、限流、降级的区别？**
 - 限流控流量，熔断对故障快速失败，降级给兜底。本项目熔断触发后降级到本地回源。
@@ -480,7 +487,7 @@ StateClosed ──连续失败≥阈值──▶ StateOpen ──冷却超时─
 - 简单计数用 atomic（无锁、更快）；多字段需要原子一致性、或保护一段复合逻辑时用 Mutex。
 
 **Q：什么是 goroutine 泄漏？你项目里有吗？**
-- goroutine 无法退出、一直占资源。本项目里文件发现轮询、TTL 清理 goroutine 没纳入优雅关闭（进程退出即终止），严格说生命周期没闭环——这是个可以主动说的改进点。
+- goroutine 无法退出、一直占资源。本项目曾经有文件发现轮询、TTL 清理和 gRPC server 生命周期未闭环的问题，现在关闭顺序已覆盖：`FileDiscovery.Close`、`Group.Close`、`GRPCPool.Shutdown` 都会被 cmd 显式调用；HTTP/gRPC server 的监听 goroutine 通过 `Shutdown` 返回。
 
 **Q：http.Server.Shutdown 和 Close 区别？**
 - Shutdown 优雅（停收新连接、等请求处理完、可配超时）；Close 立即关闭所有连接。
@@ -515,19 +522,19 @@ StateClosed ──连续失败≥阈值──▶ StateOpen ──冷却超时─
 - **面试官可能问**：「你的 /metrics 为什么没有内存占用？」「这个值会不会和真实用量对不上？」
 - **诚实说法**：> 「之前有个恒为 0 的死 gauge，我先把它删了，后来改成抓取时从 LRU 的实时状态派生：`lru.Bytes()` 返回 `nbytes`，在 `cache.mu` 保护下按 group 读取。没有单独维护 atomic 镜像，所以不会漂移；代价是它和计数器不是同一把锁下的严格快照，但两者本来就是独立的指标族。」
 
-### 雷点 3：后台 goroutine 没纳入优雅关闭
+### 雷点 3（已修复）：后台 goroutine 没纳入优雅关闭
 
-- **事实**：`FileDiscovery` 轮询 goroutine（`filediscovery.go:70-98`）和 TTL 清理 goroutine（`cache.go:48-63`）在进程退出时只是随进程终止，没显式 `Close`。HTTP server 的优雅关闭是规范的，但这两个后台任务生命周期没闭环。
-- **面试官可能问**：「你的优雅关闭完整吗？后台 goroutine 怎么退出的？」
-- **诚实说法**：> 「HTTP 层我用 `signal.Notify` + `Shutdown` 做了优雅关闭，但文件发现的 3 秒轮询和 TTL 清理这两个后台 goroutine 目前是随进程退出的，没显式停。更完整的做法是用 context/stopCh 通知它们退出，统一纳入 shutdown 流程。」
-- **怎么补**：`FileDiscovery` 已有 `Close()`（`close(stopCh)`），main 里补一句 `discovery.Close()`；TTL 清理用 `context` 或 `stopCh` 让 ticker goroutine 可退出。这个改进能直接讲出「goroutine 泄漏/生命周期」的知识点。
+- **修复前**：`FileDiscovery` 轮询/心跳和 TTL 清理 goroutine 在进程退出时只是随进程终止，没显式 `Close`；gRPC client 连接也没有统一的关闭路径。
+- **修复后**：`cmd` 按固定顺序关闭——`discovery.Close()` 停轮询/心跳 → `Unregister` 注销节点 → HTTP 入口 `Shutdown` → `GRPCPool.Shutdown(ctx)`（GracefulStop 超时后强制 Stop，再关闭客户端连接）→ `Group.Close()` 停 TTL 清理。`FileDiscovery.Close` 与 `Group.Close` 都是幂等的。
+- **面试官可能问**：「你的优雅关闭完整吗？后台 goroutine 和 gRPC 连接怎么退出的？」
+- **可以说**：> 「关闭是分阶段的：先停止发现并注销，避免心跳把节点重新写回；再停 HTTP 入口；gRPC 先 GracefulStop 等在途 RPC，超时强制停止，最后才关闭客户端连接，因为在途 handler 可能还要转发到其他节点；最后停掉 TTL 清理循环。」
 
-### 雷点 4：熔断器是 per-group 粒度
+### 雷点 4（已修复）：熔断器曾是 per-group 粒度
 
-- **事实**：`geecache.go:34` 一个 Group 一个 breaker，任一远端连续失败 3 次会熔断该 group 的**所有**远程获取，10 秒内全降级本地。
+- **修复前**：一个 Group 一个 breaker，任一远端失败会熔断该 Group 的**所有**远程获取。
+- **修复后**：内置 `httpGetter`/`grpcGetter` 实现 `PeerBreakerProvider`，按 **(Group, peer)** 各持一个熔断器；peer 下线时 getter 被关闭并丢弃，状态自然回收。失败计数还改成 30 秒滑动窗口，并区分配置错误/正常未命中（neutral，不计失败）。
 - **面试官可能问**：「如果两个远程节点一个好一个坏，你的熔断器会怎样？」
-- **诚实说法**：> 「目前熔断器是 group 级别的，一个 group 共享一个 breaker，所以某个远端连续失败会影响到这个 group 的所有远程请求。对只有单一『远端』语义的 demo 够用，但多异构 peer 场景粒度偏粗，生产化应该改成 per-peer 粒度，每个对端独立熔断。」
-- **怎么补**：把 breaker 从 Group 移到 `PeerGetter` 级别（或 `map[peer]*CircuitBreaker`），每个对端独立计数。这是「熔断粒度」的经典设计权衡，讲出来很加分。
+- **可以说**：> 「熔断器挂在每个 peer 的 getter 上，按 Group 再隔离一层，所以坏节点只会熔断发往它的请求。失败按 30 秒窗口计数，避免低频失败长期累积；对端可达但 key 不存在或配置错误属于 neutral，不会误开熔断。」
 
 ### 雷点 5（已修复）：`GRPCPool` 没有 `StartDiscovery`
 
@@ -549,4 +556,4 @@ StateClosed ──连续失败≥阈值──▶ StateOpen ──冷却超时─
 1. **白板**：只拿 Part 0 的链路图，合上手册，讲 30 秒版 + 3 分钟版。
 2. **从 0 推导**：合上 Part 2，从「需求」推到「优雅关闭」，卡壳处回到对应「痛点→方案→取舍」。
 3. **mock 面试**：让我扮演面试官逐题问（Part 3 + Part 4 的追问），你答完我给你打分纠错，反复几轮。
-4. **跑起来自证**：`./run.sh` 起 3 节点，`curl` 验证命中/回源/熔断/`/health`/`/metrics` 每条路径，确保你讲的每个机制都能当场演示、每个指标都对应真实行为。
+4. **跑起来自证**：`./run.sh` 起 3 个 HTTP 节点，`curl` 验证命中/回源/熔断/`/health`/`/metrics`；再用 `-transport=grpc -admin-addr=...` 起一组 gRPC 节点验证同一条链路，确保你讲的每个机制都能当场演示、每个指标都对应真实行为。

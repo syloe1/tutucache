@@ -18,7 +18,8 @@ Group.Get(key)
              │           │     ├─ 成功 → RecordSuccess(ticket) + RecordPeerLoad → 返回
              │           │     └─ 失败 → RecordFailure(ticket) → 降级
              │           └─ 降级 → getLocal(key)
-             └─ 本地 key / 远程失败 → getLocal(key)
+             └─ 本地 key / 临时远程故障 → getLocal(key)
+                   （认证/配置错误则向上返回，不降级）
                    └─ getter.Get(key) 回源 → cloneBytes 深拷贝 → populateCache 写回
 ```
 
@@ -47,15 +48,16 @@ Group.Get(key)
 ### 第 5 层：核心调度 Group（`geecache.go`）
 - Group 是独立缓存命名空间，对外查询入口，串联：本地缓存查询 → 分布式节点路由 → 回源。
 - **singleflight 防击穿**：同一个 key 大量并发 miss 时，只放行 1 个协程去回源，其余阻塞等待复用结果。
-- **熔断器容错**：远程节点连续失败 N 次后熔断，跳过远程直接降级到本地回源。
+- **熔断器容错**：远程节点在时间窗口内失败 N 次后熔断，跳过远程直接降级到本地回源。
 - **SetTTL(ttl, cleanupInterval)**：设默认过期时间（只对之后写入的条目生效）+ 可选启动后台清理；`cleanupInterval == 0` 时仍由 Get 惰性删除，并在写入时摊销回收过期冷 key；**Purge()** 清空本机该 Group 的本地缓存，切换 TTL 时可配合使用。
 
 ### 第 6 层：节点通信（`http.go` + `peers_grpc.go`）
 - **PeerPicker 接口**做节点管理：`PickPeer(key)` 用一致性哈希选节点。
 - **PeerGetter 接口**做远程取数：`Get(in *pb.Request, out *pb.Response) error`，protobuf 序列化。
-- 两种实现：
+- 两种实现，能力对齐：
   - **HTTPPool**：HTTP 服务端（接收其他节点查询）+ 内置 `httpGetter` 客户端；用独立请求头做简单鉴权，可开 TLS/HTTPS 加密内网通信。
-  - **GRPCPool**：gRPC 服务端 `GRPCServer` + 客户端 `grpcGetter`，共用同一套接口和 proto 定义。
+  - **GRPCPool**：gRPC 服务端 `GRPCServer` + 客户端 `grpcGetter`；共享 token 通过 unary interceptor 校验（每次 RPC 读取，可热轮换），TLS/mTLS 与 HTTP 共用配置构建，地址统一为裸 `host:port`。
+  - 两者都实现了 `StartDiscovery`，并负责客户端连接的生命周期；gRPC 还提供 `ServeListener` 与带超时的 `Shutdown`。
 
 ### 第 7 层：一致性哈希环（`consistenthash/consistenthash.go`）
 - `crc32` 做哈希，每个真实节点生成 `replicas`（50）个虚拟节点，标识为 `i + key`。
@@ -63,18 +65,18 @@ Group.Get(key)
 
 ### 第 8 层：服务发现（`discovery.go` + `filediscovery.go`）
 - `ServiceDiscovery` 接口抽象「获取/注册/监听节点列表」。
-- `FileDiscovery` 基于共享 `peers.json`，后台每 3 秒读一次，节点列表变化时回调 → `Pool.Set(peers...)` 重建哈希环，**动态更新 peer 列表**。
+- `FileDiscovery` 基于共享 `peers.json`，后台每 3 秒读一次，节点列表变化时回调 → `Pool.Set(peers...)`；两个 Pool 都按差集增量更新哈希环，只关闭下线节点的连接，**动态更新 peer 列表**。
 
 ### 第 9 层：指标埋点 + 健康检查 + 优雅关闭
 - **指标**（`metrics.go`）：每个 Group 独立计数命中/未命中/本地加载/远程加载/淘汰，锁保护的一致快照；`/metrics` 按 `group` 标签暴露原始计数器，命中率交给 Prometheus `rate()`。
-- **健康检查**：`/health` 返回 200 "OK"。
-- **优雅关闭**（`cmd/main.go`）：监听 SIGINT/SIGTERM → `http.Server.Shutdown` 等请求处理完再退（10s 超时）。
+- **健康检查**：`/health` 返回 200 "OK"。HTTP 模式由节点 handler 直接提供；gRPC 模式通过 `-admin-addr` 启动独立管理端口，同时暴露 `/health` 与 `/metrics`。
+- **优雅关闭**（`cmd/main.go`）：监听 SIGINT/SIGTERM → 停止服务发现并注销节点 → `http.Server.Shutdown` 等待 HTTP 请求完成 → `GRPCPool.Shutdown(ctx)` 优雅停止 gRPC（10s 超时后强制停止）→ `Group.Close()` 停止后台清理循环。
 
 ## 三、熔断器状态流转
 
 ```
 Closed（闭合，正常放行）
-   ↓ 连续失败达到阈值 N 次
+   ↓ 窗口内失败达到阈值 N 次
 Open（熔断打开，拒绝请求）
    ↓ 等待 timeout 时间到期
 HalfOpen（半开，只放行探测请求）
@@ -82,6 +84,6 @@ HalfOpen（半开，只放行探测请求）
    └─ 探测请求失败 → 切回 Open，继续熔断
 ```
 
-- 本项目：`NewCircuitBreaker(3, 10*time.Second)`，连续失败 3 次熔断、10 秒后尝试恢复。
+- 本项目：失败阈值 3、冷却 10 秒、失败计数窗口 30 秒；只有窗口内的失败才累计，10 秒后放行一个探测请求。
 - 接入点：`getFromPeer` —— 熔断打开时直接快速失败，上层 `load` 自动降级到 `getLocal` 回源。
 - 隔离粒度：内置 `httpGetter`/`grpcGetter` 按 **(Group, peer)** 各持一个熔断器，一个坏节点不会熔断其他健康节点；熔断状态随 peer 客户端生命周期回收。
