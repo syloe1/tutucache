@@ -10,11 +10,14 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"geecache"
+	"io"
 	"math/big"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 )
@@ -304,6 +307,182 @@ func TestStartAPIServerReportsServeError(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("serve error was not reported on channel within timeout")
+	}
+}
+
+func TestParseTransport(t *testing.T) {
+	tests := []struct {
+		in      string
+		want    string
+		wantErr bool
+	}{
+		{in: "http", want: "http"},
+		{in: "HTTP", want: "http"},
+		{in: " grpc ", want: "grpc"},
+		{in: "GRPC", want: "grpc"},
+		{in: "", wantErr: true},
+		{in: "tcp", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.in, func(t *testing.T) {
+			got, err := parseTransport(tt.in)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("parseTransport(%q) = %q, want error", tt.in, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseTransport(%q) error: %v", tt.in, err)
+			}
+			if got != tt.want {
+				t.Errorf("parseTransport(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+// gRPC 节点服务必须注册裸 host:port，并能在 Shutdown 后干净退出。
+func TestStartGRPCCacheServer(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	gee := geecache.NewGroup("startup-grpc", 1<<10, geecache.GetterFunc(func(string) ([]byte, error) {
+		return nil, nil
+	}))
+	serveErr := make(chan error, 1)
+
+	const selfAddr = "127.0.0.1:18001"
+	pool, discovery, err := startGRPCCacheServer(selfAddr, "127.0.0.1:0", gee, tlsSettings{}, serveErr)
+	if err != nil {
+		t.Fatalf("startGRPCCacheServer() error: %v", err)
+	}
+	defer discovery.Close()
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := pool.Shutdown(ctx); err != nil {
+			t.Errorf("Shutdown() error: %v", err)
+		}
+	}()
+
+	peers, err := discovery.GetPeers()
+	if err != nil {
+		t.Fatalf("GetPeers() error: %v", err)
+	}
+	if !slices.Contains(peers, selfAddr) {
+		t.Errorf("peers.json = %v, want it to contain %s", peers, selfAddr)
+	}
+
+	select {
+	case err := <-serveErr:
+		t.Fatalf("unexpected runtime error: %v", err)
+	default:
+	}
+}
+
+func TestStartGRPCCacheServerBindFailure(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to occupy port: %v", err)
+	}
+	defer ln.Close()
+
+	gee := geecache.NewGroup("startup-grpc-bind", 1<<10, geecache.GetterFunc(func(string) ([]byte, error) {
+		return nil, nil
+	}))
+
+	_, _, err = startGRPCCacheServer("127.0.0.1:18001", ln.Addr().String(), gee, tlsSettings{}, make(chan error, 1))
+	if err == nil {
+		t.Fatal("expected bind conflict error, got nil")
+	}
+}
+
+func TestStartGRPCCacheServerTLSFailure(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	gee := geecache.NewGroup("startup-grpc-tls", 1<<10, geecache.GetterFunc(func(string) ([]byte, error) {
+		return nil, nil
+	}))
+	tlsCfg := tlsSettings{
+		enabled:  true,
+		certFile: "/nonexistent/cert.pem",
+		keyFile:  "/nonexistent/key.pem",
+	}
+
+	_, _, err := startGRPCCacheServer("127.0.0.1:18001", "127.0.0.1:0", gee, tlsCfg, make(chan error, 1))
+	if err == nil {
+		t.Fatal("expected error when TLS cert cannot be loaded, got nil")
+	}
+}
+
+// gRPC target 不接受 URL scheme，配置错误必须在启动阶段暴露。
+func TestStartGRPCCacheServerRejectsURLSelf(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	gee := geecache.NewGroup("startup-grpc-url", 1<<10, geecache.GetterFunc(func(string) ([]byte, error) {
+		return nil, nil
+	}))
+
+	_, _, err := startGRPCCacheServer("http://127.0.0.1:18001", "127.0.0.1:0", gee, tlsSettings{}, make(chan error, 1))
+	if err == nil {
+		t.Fatal("expected error for URL-form gRPC self address, got nil")
+	}
+}
+
+// admin 端口暴露 /health 与 /metrics，并且沿用统一的超时配置。
+func TestStartAdminServer(t *testing.T) {
+	serveErr := make(chan error, 1)
+	srv, err := startAdminServer("127.0.0.1:0", serveErr)
+	if err != nil {
+		t.Fatalf("startAdminServer() error: %v", err)
+	}
+	defer srv.Close()
+
+	assertServerTimeouts(t, srv)
+
+	get := func(path string) (int, string) {
+		t.Helper()
+		resp, err := http.Get("http://" + srv.Addr + path)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("read GET %s: %v", path, err)
+		}
+		return resp.StatusCode, string(body)
+	}
+
+	if code, body := get("/health"); code != http.StatusOK || body != "OK" {
+		t.Errorf("GET /health = %d %q, want 200 OK", code, body)
+	}
+	code, body := get("/metrics")
+	if code != http.StatusOK {
+		t.Errorf("GET /metrics status = %d, want 200", code)
+	}
+	if !strings.Contains(body, "geecache_hits_total") {
+		t.Errorf("GET /metrics body missing geecache_hits_total:\n%s", body)
+	}
+
+	select {
+	case err := <-serveErr:
+		t.Fatalf("unexpected runtime error: %v", err)
+	default:
+	}
+}
+
+func TestStartAdminServerBindFailure(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to occupy port: %v", err)
+	}
+	defer ln.Close()
+
+	if _, err := startAdminServer(ln.Addr().String(), make(chan error, 1)); err == nil {
+		t.Fatal("expected bind conflict error, got nil")
 	}
 }
 
