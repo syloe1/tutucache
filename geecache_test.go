@@ -169,6 +169,41 @@ func TestLoadFallsBackOnServerError(t *testing.T) {
 	}
 }
 
+// valuePeerGetter 返回预置字节切片，便于观察 ByteView 是否与响应缓冲区共享底层数组。
+type valuePeerGetter struct {
+	value []byte
+}
+
+func (p *valuePeerGetter) Get(_ *pb.Request, out *pb.Response) error {
+	out.Value = p.value
+	return nil
+}
+
+// 回归 #16：peer 返回的 ByteView 必须独占底层数组，不能被响应缓冲区后续修改影响。
+func TestGetFromPeerClonesValue(t *testing.T) {
+	g := NewGroup("test_peer_clone", 1<<10, GetterFunc(func(string) ([]byte, error) {
+		t.Fatal("local getter must not be called")
+		return nil, nil
+	}))
+
+	buf := []byte("peer-data")
+	peer := &valuePeerGetter{value: buf}
+
+	v, err := g.getFromPeer(peer, "key")
+	if err != nil {
+		t.Fatalf("getFromPeer: %v", err)
+	}
+	if got := v.String(); got != "peer-data" {
+		t.Fatalf("value = %q, want %q", got, "peer-data")
+	}
+
+	// 模拟对端响应缓冲区被复用/改写：ByteView 必须是独立副本。
+	buf[0] = 'X'
+	if got := v.String(); got != "peer-data" {
+		t.Fatalf("peer value aliases response buffer: got %q", got)
+	}
+}
+
 // TestConfigErrorDoesNotTripBreaker 连续多次配置错误不会打开熔断器。
 func TestConfigErrorDoesNotTripBreaker(t *testing.T) {
 	peer := &stubPeerGetter{err: &PeerHTTPError{StatusCode: http.StatusUnauthorized}}
