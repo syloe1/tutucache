@@ -1,10 +1,7 @@
 package geecache
 
 import (
-	"crypto/sha256"
-	"crypto/subtle"
 	"crypto/tls"
-	"crypto/x509"
 	"errors"
 	"fmt"
 	"geecache/consistenthash"
@@ -13,7 +10,6 @@ import (
 	"log"
 	"net/http"
 	"net/url"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -97,38 +93,9 @@ func NewHTTPPool(self string) *HTTPPool {
 // 可在 Set/StartDiscovery 之后调用：配置更新会立即应用到已有 peer 的 getter。
 // 通过 TLSConfig() 取到的快照视为只读；再次调用会整体替换配置。
 func (p *HTTPPool) EnableTLS(certFile, keyFile, caCertFile string) error {
-	// 加载节点证书 + 私钥对
-	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	serverCfg, clientCfg, err := buildPeerTLSConfigs(certFile, keyFile, caCertFile)
 	if err != nil {
-		return fmt.Errorf("load cert: %w", err)
-	}
-
-	// 服务端和客户端角色必须使用两份独立的配置：
-	// 服务端需要 ClientCAs + ClientAuth 校验客户端证书；
-	// 客户端需要 RootCAs 校验服务端证书。
-	serverCfg := &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS12,
-	}
-	clientCfg := &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS12,
-	}
-
-	if caCertFile != "" {
-		caCert, err := os.ReadFile(caCertFile)
-		if err != nil {
-			return fmt.Errorf("read CA cert: %w", err)
-		}
-		caCertPool := x509.NewCertPool()
-		if !caCertPool.AppendCertsFromPEM(caCert) {
-			return errors.New("append CA cert: invalid PEM")
-		}
-		// 服务端用 ClientCAs 校验客户端证书。
-		serverCfg.ClientCAs = caCertPool
-		serverCfg.ClientAuth = tls.RequireAndVerifyClientCert
-		// 客户端用 RootCAs 校验远端节点的服务端证书。
-		clientCfg.RootCAs = caCertPool
+		return err
 	}
 
 	p.mu.Lock()
@@ -155,10 +122,7 @@ func (p *HTTPPool) SetSharedToken(token string) {
 }
 
 // authorized 校验请求携带的共享 token；未配置 token 时不做鉴权。
-//
-// 比较走 SHA-256 摘要 + subtle.ConstantTimeCompare：两者都是固定 32 字节，
-// 不会像字符串 != 那样在前缀不匹配时提前返回，避免通过响应时间逐字节
-// 猜测 token；先取摘要也避免了 ConstantTimeCompare 在长度不同时提前返回。
+// 恒定时间比较见 tokenEqual。
 func (p *HTTPPool) authorized(got string) bool {
 	p.mu.Lock()
 	want := p.sharedToken
@@ -166,9 +130,7 @@ func (p *HTTPPool) authorized(got string) bool {
 	if want == "" {
 		return true
 	}
-	gotHash := sha256.Sum256([]byte(got))
-	wantHash := sha256.Sum256([]byte(want))
-	return subtle.ConstantTimeCompare(gotHash[:], wantHash[:]) == 1
+	return tokenEqual(got, want)
 }
 
 // TLSConfig 返回服务端 TLS 配置（供 main.go 的 http.Server 使用）。
@@ -190,8 +152,7 @@ func (p *HTTPPool) Log(format string, v ...interface{}) {
 func (p *HTTPPool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// /health 和 /metrics 不校验 token
 	if r.URL.Path == "/health" {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("OK"))
+		writeHealth(w, r)
 		return
 	}
 	if r.URL.Path == "/metrics" {

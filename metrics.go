@@ -91,6 +91,17 @@ type groupMetrics struct {
 	cacheBytes int64 // 抓取时从 LRU 实时读取，不是 Metrics 里的计数器
 }
 
+// HealthHandler 返回健康检查 handler，供 HTTPPool 与独立 admin 端口共用。
+func HealthHandler() http.Handler {
+	return http.HandlerFunc(writeHealth)
+}
+
+// writeHealth 是 /health 的唯一实现：200 + "OK"。
+func writeHealth(w http.ResponseWriter, _ *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("OK"))
+}
+
 // MetricsHandler 返回一个 http.Handler，按 group 标签暴露 Prometheus 风格指标。
 func MetricsHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
