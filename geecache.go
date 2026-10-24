@@ -3,6 +3,7 @@ package geecache
 import (
 	"fmt"
 	pb "geecache/geecachepb"
+	"geecache/lru"
 	"geecache/singleflight"
 	"log"
 	"sync"
@@ -106,7 +107,8 @@ func NewGroup(name string, cacheBytes int64, getter Getter) *Group {
 		metrics: m,
 		mainCache: cache{
 			cacheBytes: cacheBytes,
-			metrics:    m,
+			// 淘汰回调在 cache.mu 释放后调用，只做指标累加。
+			onEvicted: func(lru.EvictItem) { m.RecordEviction() },
 		},
 		loader:  singleflight.NewGroup(),
 		breaker: NewCircuitBreaker(3, 10*time.Second), // 连续失败3次 → 熔断10秒

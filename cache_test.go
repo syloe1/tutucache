@@ -1,6 +1,9 @@
 package geecache
 
 import (
+	"fmt"
+	"geecache/lru"
+	"sync"
 	"testing"
 	"time"
 )
@@ -133,5 +136,162 @@ func TestGroupCloseStopsCleanup(t *testing.T) {
 	// Close 只停止后台清理，不影响正常读取。
 	if _, err := g.Get("a"); err != nil {
 		t.Fatalf("Get after Close failed: %v", err)
+	}
+}
+
+// reentrantOnEvicted 返回一个会重入 cache 的淘汰回调。
+// 如果回调在持有 c.mu 时执行，调用方会死锁。
+func reentrantOnEvicted(c *cache, ran chan<- struct{}) func(lru.EvictItem) {
+	var once sync.Once
+	return func(lru.EvictItem) {
+		c.get("missing")
+		once.Do(func() { close(ran) })
+	}
+}
+
+func waitForCallback(t *testing.T, ran <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-ran:
+	case <-time.After(2 * time.Second):
+		t.Fatal("eviction callback ran while holding the cache lock")
+	}
+}
+
+func TestEvictionCallbackRunsOutsideLockOnAdd(t *testing.T) {
+	c := &cache{cacheBytes: 4}
+	ran := make(chan struct{})
+	c.onEvicted = reentrantOnEvicted(c, ran)
+
+	c.add("a", ByteView{b: []byte("aa")}, 0) // 1+2=3 字节
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		c.add("b", ByteView{b: []byte("bb")}, 0) // 3+3 > 4，淘汰 a
+	}()
+
+	waitForCallback(t, ran)
+	<-done
+}
+
+func TestEvictionCallbackRunsOutsideLockOnLazyExpiry(t *testing.T) {
+	c := &cache{cacheBytes: 1000}
+	ran := make(chan struct{})
+	c.onEvicted = reentrantOnEvicted(c, ran)
+
+	c.add("k", ByteView{b: []byte("v")}, 10*time.Millisecond)
+	time.Sleep(20 * time.Millisecond)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if _, ok := c.get("k"); ok {
+			t.Error("expired key reported as a hit")
+		}
+	}()
+
+	waitForCallback(t, ran)
+	<-done
+}
+
+func TestEvictionCallbackRunsOutsideLockOnCleanup(t *testing.T) {
+	c := &cache{cacheBytes: 1000}
+	ran := make(chan struct{})
+	c.onEvicted = reentrantOnEvicted(c, ran)
+
+	c.add("k", ByteView{b: []byte("v")}, 10*time.Millisecond)
+	time.Sleep(20 * time.Millisecond)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		c.cleanupExpired(nil)
+	}()
+
+	waitForCallback(t, ran)
+	<-done
+}
+
+func TestLazyExpiryRecordsEviction(t *testing.T) {
+	m := NewMetrics()
+	c := &cache{
+		cacheBytes: 1000,
+		onEvicted:  func(lru.EvictItem) { m.RecordEviction() },
+	}
+	c.add("k", ByteView{b: []byte("v")}, 10*time.Millisecond)
+	time.Sleep(20 * time.Millisecond)
+
+	if _, ok := c.get("k"); ok {
+		t.Fatal("expired key reported as a hit")
+	}
+	if got := m.Snapshot().Evictions; got != 1 {
+		t.Fatalf("evictions=%d, want 1", got)
+	}
+}
+
+func TestCleanupRecordsEvictions(t *testing.T) {
+	m := NewMetrics()
+	c := &cache{
+		cacheBytes: 1000,
+		onEvicted:  func(lru.EvictItem) { m.RecordEviction() },
+	}
+	c.add("k", ByteView{b: []byte("v")}, 10*time.Millisecond)
+	c.add("live", ByteView{b: []byte("v")}, 0)
+	time.Sleep(20 * time.Millisecond)
+
+	c.cleanupExpired(nil)
+
+	if got := m.Snapshot().Evictions; got != 1 {
+		t.Fatalf("evictions=%d, want 1", got)
+	}
+	// 只剩 "live"：key 4 字节 + value 1 字节。
+	if got := c.Bytes(); got != 5 {
+		t.Fatalf("cache bytes=%d, want 5", got)
+	}
+}
+
+func TestCleanupExpiredProcessesMultipleBatches(t *testing.T) {
+	c := &cache{cacheBytes: 1 << 20}
+	total := cleanupBatchSize*2 + 17
+	for i := 0; i < total; i++ {
+		c.add(fmt.Sprintf("k%d", i), ByteView{b: []byte("v")}, 10*time.Millisecond)
+	}
+	time.Sleep(20 * time.Millisecond)
+
+	c.cleanupExpired(nil)
+
+	if got := c.Bytes(); got != 0 {
+		t.Fatalf("cache bytes after cleanup=%d, want 0", got)
+	}
+}
+
+func TestEvictCallbackNoCacheMu(t *testing.T) {
+	c := &cache{cacheBytes: 1024}
+	checked := make(chan bool, 1)
+	c.onEvicted = func(lru.EvictItem) {
+		// 回调执行时 c.mu 必须可用。Go 的 Mutex 不可重入，
+		// 如果回调是在持锁路径里调用的，这里 TryLock 会返回 false。
+		ok := c.mu.TryLock()
+		if ok {
+			c.mu.Unlock()
+		}
+		select {
+		case checked <- ok:
+		default:
+		}
+	}
+
+	// 每个条目 2 + 500 = 502 字节；第三个条目写入后超过 1024，触发淘汰。
+	c.add("k1", ByteView{b: make([]byte, 500)}, 0)
+	c.add("k2", ByteView{b: make([]byte, 500)}, 0)
+	c.add("k3", ByteView{b: make([]byte, 500)}, 0)
+
+	select {
+	case ok := <-checked:
+		if !ok {
+			t.Fatal("cache.mu still held during eviction callback")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("eviction callback did not run")
 	}
 }
