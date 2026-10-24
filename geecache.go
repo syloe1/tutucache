@@ -205,8 +205,9 @@ func (g *Group) getFromPeer(peer PeerGetter, key string) (ByteView, error) {
 
 	g.breaker.RecordSuccess(ticket) // 成功 → 重置熔断器
 	g.metrics.RecordPeerLoad()
-	//包装成ByteView
-	return ByteView{b: res.Value}, nil
+	// 与 getLocal 保持一致：深拷贝后再封装，保证 ByteView 独占底层数组。
+	// 否则响应缓冲区后续被复用或写入缓存时，缓存值与调用方会共享同一块内存。
+	return ByteView{b: cloneBytes(res.Value)}, nil
 }
 func (g *Group) getLocal(key string) (ByteView, error) {
 	g.metrics.RecordLocalLoad()
