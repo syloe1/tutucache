@@ -53,6 +53,7 @@ func (s *GRPCServer) Get(ctx context.Context, req *pb.Request) (*pb.Response, er
 type grpcGetter struct {
 	addr   string
 	client pb.GroupCacheClient
+	conn   *grpc.ClientConn
 }
 
 // 编译期断言：grpcGetter 实现了 PeerGetter
@@ -77,6 +78,19 @@ func (g *grpcGetter) Get(in *pb.Request, out *pb.Response) error {
 	return nil
 }
 
+// close 关闭底层 gRPC 连接。
+// 重复关闭时 grpc 返回 Canceled 状态，这里视为已关闭而不是失败；
+// conn 为 nil 时直接返回，兼容测试中手工构造的 getter。
+func (g *grpcGetter) close() error {
+	if g.conn == nil {
+		return nil
+	}
+	if err := g.conn.Close(); err != nil && status.Code(err) != codes.Canceled {
+		return err
+	}
+	return nil
+}
+
 // =============================================================================
 // gRPC 节点池 —— 实现项目的 PeerPicker 接口
 // =============================================================================
@@ -87,6 +101,7 @@ type GRPCPool struct {
 	peers       *consistenthash.Map    // 一致性哈希环，映射 key → 节点
 	grpcGetters map[string]*grpcGetter // 节点地址 → gRPC 客户端
 	grpcServer  *grpc.Server           // 本节点的 gRPC server
+	stopped     bool                   // Stop 后置位，阻止后续 Set 重新建立客户端连接
 }
 
 // 编译期断言：GRPCPool 实现了 PeerPicker
@@ -106,10 +121,30 @@ func (p *GRPCPool) Log(format string, v ...interface{}) {
 	log.Printf("[GRPCPool %s] %s", p.self, fmt.Sprintf(format, v...))
 }
 
-// Set 初始化集群中的所有节点，每个节点复用已建立的 gRPC 连接
+// Set 初始化集群中的所有节点，每个节点复用已建立的 gRPC 连接。
+// 与上一次的节点列表做差集，关闭并移除已下线节点的连接，防止拓扑变化时泄漏。
 func (p *GRPCPool) Set(peers ...string) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
+	// Stop 之后不再建立新连接，否则连接会在 Stop 清理之后重新泄漏。
+	if p.stopped {
+		p.mu.Unlock()
+		return
+	}
+
+	// 新节点集合，用于差集判断
+	newPeerSet := make(map[string]struct{}, len(peers))
+	for _, peer := range peers {
+		newPeerSet[peer] = struct{}{}
+	}
+	// 找出旧 getter 中不在新列表里的 peer：锁内只摘除，锁外再关闭。
+	// 关闭连接需要拆解 resolver/balancer，放到锁外可避免阻塞 PickPeer。
+	stale := make(map[string]*grpcGetter)
+	for addr, getter := range p.grpcGetters {
+		if _, ok := newPeerSet[addr]; !ok {
+			stale[addr] = getter
+			delete(p.grpcGetters, addr)
+		}
+	}
 
 	// 构建一致性哈希环
 	p.peers = consistenthash.New(defaultGRPCReplicas, nil)
@@ -134,7 +169,18 @@ func (p *GRPCPool) Set(peers ...string) {
 		p.grpcGetters[peer] = &grpcGetter{
 			addr:   peer,
 			client: pb.NewGroupCacheClient(conn),
+			conn:   conn,
 		}
+	}
+	p.mu.Unlock()
+
+	// 锁外关闭已下线节点的连接
+	for addr, getter := range stale {
+		if err := getter.close(); err != nil {
+			p.Log("close stale grpc conn %s failed: %v", addr, err)
+			continue
+		}
+		p.Log("closed stale peer conn: %s", addr)
 	}
 }
 
@@ -169,7 +215,23 @@ func (p *GRPCPool) Serve() error {
 	return p.grpcServer.Serve(lis)
 }
 
-// Stop 优雅关闭 gRPC 服务
+// Stop 优雅关闭 gRPC 服务，并关闭全部客户端连接
 func (p *GRPCPool) Stop() {
+	// 先停止接收并 drain 入站请求，不持 p.mu：正在处理的 handler 可能还需要
+	// 通过客户端连接转发到其他节点，因此此时不能先关闭客户端连接。
 	p.grpcServer.GracefulStop()
+
+	// 锁内只做快照和清空，不做阻塞 I/O
+	p.mu.Lock()
+	p.stopped = true
+	getters := p.grpcGetters
+	p.grpcGetters = make(map[string]*grpcGetter)
+	p.mu.Unlock()
+
+	// 锁外关闭
+	for addr, getter := range getters {
+		if err := getter.close(); err != nil {
+			p.Log("close client conn %s on stop failed: %v", addr, err)
+		}
+	}
 }

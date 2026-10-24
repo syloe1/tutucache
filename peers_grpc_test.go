@@ -11,6 +11,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
@@ -278,5 +279,80 @@ func TestGRPCIntegration_MultiNode(t *testing.T) {
 	expected := "shared-" + testKey
 	if string(resp.Value) != expected {
 		t.Fatalf("expected %q, got %q", expected, resp.Value)
+	}
+}
+
+func TestGRPCPool_Set_RemovePeerCloseConn(t *testing.T) {
+	p := NewGRPCPool("localhost:9000")
+	p.Set("localhost:9001", "localhost:9002")
+
+	staleGetter := p.grpcGetters["localhost:9002"]
+	if staleGetter == nil {
+		t.Fatal("expect getter for localhost:9002 exists")
+	}
+
+	p.Set("localhost:9001")
+
+	if _, ok := p.grpcGetters["localhost:9002"]; ok {
+		t.Fatal("stale getter localhost:9002 still retained in map")
+	}
+	if got := staleGetter.conn.GetState(); got != connectivity.Shutdown {
+		t.Fatalf("stale conn state = %v, want %v", got, connectivity.Shutdown)
+	}
+}
+
+func TestGRPCPool_Set_ReuseExistingGetter(t *testing.T) {
+	p := NewGRPCPool("localhost:9000")
+	peers := []string{"localhost:9001", "localhost:9002"}
+	p.Set(peers...)
+
+	old9001 := p.grpcGetters["localhost:9001"]
+	if old9001 == nil {
+		t.Fatal("expect getter localhost:9001 exists")
+	}
+
+	p.Set(peers...)
+	new9001 := p.grpcGetters["localhost:9001"]
+	if old9001 != new9001 {
+		t.Fatal("getter pointer changed, expected reuse old getter and conn")
+	}
+	if got := new9001.conn.GetState(); got == connectivity.Shutdown {
+		t.Fatalf("survived conn state = %v, should not be shutdown", got)
+	}
+}
+
+func TestGRPCPool_Stop_CloseAllConn(t *testing.T) {
+	p := NewGRPCPool("localhost:9000")
+	p.Set("localhost:9001", "localhost:9002", "localhost:9003")
+
+	getters := make(map[string]*grpcGetter)
+	for addr, g := range p.grpcGetters {
+		getters[addr] = g
+	}
+	if len(getters) != 3 {
+		t.Fatalf("want 3 getters, got %d", len(getters))
+	}
+
+	p.Stop()
+	if len(p.grpcGetters) != 0 {
+		t.Fatalf("grpcGetters map not empty after Stop, len=%d", len(p.grpcGetters))
+	}
+
+	for addr, g := range getters {
+		if got := g.conn.GetState(); got != connectivity.Shutdown {
+			t.Fatalf("peer %s conn state = %v, want %v", addr, got, connectivity.Shutdown)
+		}
+	}
+}
+
+func TestGRPCPool_SetAfterStop_NoNewConn(t *testing.T) {
+	p := NewGRPCPool("localhost:9000")
+	p.Set("localhost:9001")
+	p.Stop()
+
+	// Stop 后 discovery 的 Watch 仍可能回调 Set，此时不应再建立新连接。
+	p.Set("localhost:9002")
+	if len(p.grpcGetters) != 0 {
+		t.Fatalf("Set after Stop created %d getters, want 0", len(p.grpcGetters))
 	}
 }
