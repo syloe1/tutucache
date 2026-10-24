@@ -259,6 +259,61 @@ func TestConfigErrorDoesNotTripBreaker(t *testing.T) {
 	}
 }
 
+// 回归 #17：对端返回 key 不存在（410）是正常未命中，不能计入熔断失败。
+// 连续多次未命中后，熔断器必须保持 Closed，且每次请求都能降级到本地。
+func TestKeyNotFoundDoesNotTripBreaker(t *testing.T) {
+	const groupName = "test_not_found_no_trip"
+	var localCalls atomic.Int32
+	peer := &stubPeerGetter{err: &PeerHTTPError{StatusCode: http.StatusGone}}
+	g := NewGroup(groupName, 1<<10, GetterFunc(func(key string) ([]byte, error) {
+		localCalls.Add(1)
+		return []byte("local-" + key), nil
+	}))
+	g.RegisterPeers(&stubPicker{g: peer})
+
+	requests := defaultBreakerFailureThreshold + 3
+	for i := 0; i < requests; i++ {
+		key := fmt.Sprintf("k-%d", i)
+		v, err := g.Get(key)
+		if err != nil {
+			t.Fatalf("iteration %d: missing key should fall back locally: %v", i, err)
+		}
+		if got, want := v.String(), "local-"+key; got != want {
+			t.Fatalf("iteration %d: value = %q, want %q", i, got, want)
+		}
+	}
+
+	// 熔断器未打开：每个请求都真实到达了 peer。
+	if got := peer.calls.Load(); got != int32(requests) {
+		t.Fatalf("peer calls = %d, want %d (breaker must stay closed)", got, requests)
+	}
+	if state, _, _, _ := breakerSnapshot(g.breaker); state != StateClosed {
+		t.Fatalf("breaker state = %v, want closed", state)
+	}
+	if got := localCalls.Load(); got != int32(requests) {
+		t.Fatalf("local getter calls = %d, want %d", got, requests)
+	}
+}
+
+// getFromPeer 应把两种传输的「key 不存在」统一归一化为 ErrKeyNotFound，
+// 调用方用 errors.Is 即可判断，不必关心底层是 HTTP 还是 gRPC。
+func TestGetFromPeerNormalizesKeyNotFound(t *testing.T) {
+	g := NewGroup("test_not_found_normalize", 1<<10, GetterFunc(func(string) ([]byte, error) {
+		return []byte("local"), nil
+	}))
+
+	for _, peerErr := range []error{
+		&PeerHTTPError{StatusCode: http.StatusGone},
+		ErrKeyNotFound,
+	} {
+		peer := &stubPeerGetter{err: peerErr}
+		_, err := g.getFromPeer(peer, "k")
+		if !errors.Is(err, ErrKeyNotFound) {
+			t.Fatalf("getFromPeer(%v) = %v, want ErrKeyNotFound", peerErr, err)
+		}
+	}
+}
+
 // TestConfigErrorReleasesHalfOpenProbe 验证配置错误会释放 HalfOpen 的唯一探测名额。
 // 如果不释放，熔断器会永久卡在半开状态，之后的请求全部静默降级。
 func TestConfigErrorReleasesHalfOpenProbe(t *testing.T) {

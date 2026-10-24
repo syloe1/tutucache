@@ -2,6 +2,7 @@ package geecache
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -36,10 +37,16 @@ type GRPCServer struct {
 func (s *GRPCServer) Get(ctx context.Context, req *pb.Request) (*pb.Response, error) {
 	group := GetGroup(req.GetGroup())
 	if group == nil {
-		return nil, status.Errorf(codes.NotFound, "no such group: %s", req.GetGroup())
+		// Group 未注册属于集群配置错误，用 FailedPrecondition 与「key 不存在」的
+		// NotFound 区分，客户端才能正确分类（配置错误 vs 正常未命中）。
+		return nil, status.Errorf(codes.FailedPrecondition, "no such group: %s", req.GetGroup())
 	}
 	view, err := group.Get(req.GetKey())
 	if err != nil {
+		if errors.Is(err, ErrKeyNotFound) {
+			// 正常未命中：客户端不计入熔断，也不会当作配置错误。
+			return nil, status.Error(codes.NotFound, "key not found")
+		}
 		return nil, status.Errorf(codes.Internal, "%v", err)
 	}
 	return &pb.Response{Value: view.ByteSlice()}, nil

@@ -267,6 +267,25 @@ func TestServeHTTPCacheEndpointGetOK(t *testing.T) {
 	}
 }
 
+// 回归 #17：key 不存在时返回 410 Gone（而不是 404/500）。
+// 404 保留给「Group 未注册」这种真正的配置错误，客户端才能区分两者。
+func TestServeHTTPKeyNotFoundReturnsGone(t *testing.T) {
+	const testGroup = "http-key-not-found"
+	NewGroup(testGroup, 1<<10, GetterFunc(func(key string) ([]byte, error) {
+		return nil, fmt.Errorf("missing %s: %w", key, ErrKeyNotFound)
+	}))
+
+	p := NewHTTPPool("http://self")
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, defaultBasePath+testGroup+"/k", nil)
+
+	p.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusGone {
+		t.Fatalf("status = %d, want %d; body = %q", rec.Code, http.StatusGone, rec.Body.String())
+	}
+}
+
 // 回归测试 #12：认证先于路由和方法检查——配置 token 后，
 // 未认证请求一律 401，认证通过后未知路径才是 404、非 GET 才是 405。
 func TestServeHTTPTokenOrder(t *testing.T) {

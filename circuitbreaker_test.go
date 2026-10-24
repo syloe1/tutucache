@@ -18,7 +18,7 @@ import (
 func breakerSnapshot(cb *CircuitBreaker) (state State, failures int, probe bool, generation uint64) {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
-	return cb.state, cb.failureCount, cb.probeInFlight, cb.generation
+	return cb.state, len(cb.failureTimes), cb.probeInFlight, cb.generation
 }
 
 func mustAllow(t *testing.T, cb *CircuitBreaker) Ticket {
@@ -66,6 +66,85 @@ func TestCircuitBreaker_ClosedSuccessResetsFailureCount(t *testing.T) {
 	cb.RecordFailure(mustAllow(t, cb))
 	if state, _, _, _ := breakerSnapshot(cb); state != StateOpen {
 		t.Fatalf("state=%v, want open after 2 consecutive failures", state)
+	}
+}
+
+// 回归 #17：只有滑动窗口内的失败才计数。三次失败如果间隔都超过窗口，
+// 不能因为「历史上累计三次」而熔断。
+func TestCircuitBreaker_FailuresOutsideWindowDoNotTrip(t *testing.T) {
+	cb := newCircuitBreaker(3, time.Hour, 30*time.Millisecond)
+
+	for i := 0; i < 3; i++ {
+		cb.RecordFailure(mustAllow(t, cb))
+		if i < 2 {
+			time.Sleep(60 * time.Millisecond) // 超过窗口，之前的失败应被丢弃
+		}
+	}
+
+	state, failures, _, _ := breakerSnapshot(cb)
+	if state != StateClosed || failures != 1 {
+		t.Fatalf("after spaced failures: state=%v failures=%d, want closed/1", state, failures)
+	}
+}
+
+// 回归 #17：滑动窗口约束的是总跨度，而不是相邻两次失败的间隔。
+// 第一次失败已经滑出窗口时，即使相邻间隔都小于窗口，也不能熔断。
+func TestCircuitBreaker_WindowSpansNotChainedGaps(t *testing.T) {
+	cb := newCircuitBreaker(3, time.Hour, 50*time.Millisecond)
+
+	cb.RecordFailure(mustAllow(t, cb))
+	time.Sleep(30 * time.Millisecond)
+	cb.RecordFailure(mustAllow(t, cb))
+	time.Sleep(30 * time.Millisecond)
+	cb.RecordFailure(mustAllow(t, cb))
+
+	// 第三次失败时，第一次失败已超过 50ms 窗口，最多只剩两次计数。
+	if state, _, _, _ := breakerSnapshot(cb); state != StateClosed {
+		t.Fatalf("state=%v, want closed: first failure should have expired", state)
+	}
+}
+
+// 窗口内的连续失败仍然要能正常熔断。
+func TestCircuitBreaker_FailuresWithinWindowTrip(t *testing.T) {
+	cb := newCircuitBreaker(3, time.Hour, time.Second)
+
+	for i := 0; i < 3; i++ {
+		cb.RecordFailure(mustAllow(t, cb))
+	}
+
+	if state, failures, _, _ := breakerSnapshot(cb); state != StateOpen || failures != 3 {
+		t.Fatalf("after 3 failures within window: state=%v failures=%d, want open/3", state, failures)
+	}
+}
+
+// pruneFailureTimes 的边界：恰好等于窗口的失败记录仍然有效，
+// 只有严格早于 cutoff 的记录才会被丢弃。
+func TestCircuitBreaker_PruneFailureTimesBoundary(t *testing.T) {
+	cb := newCircuitBreaker(3, time.Hour, 30*time.Second)
+	now := time.Now()
+	cb.failureTimes = []time.Time{
+		now.Add(-31 * time.Second), // 滑出窗口
+		now.Add(-30 * time.Second), // 恰好等于窗口边界，保留
+		now.Add(-time.Second),
+	}
+
+	cb.pruneFailureTimes(now)
+
+	if got := len(cb.failureTimes); got != 2 {
+		t.Fatalf("remaining failures = %d, want 2", got)
+	}
+}
+
+// 窗口配置为 0 或负数时退化为累计计数，避免配置错误让熔断器永远无法打开。
+func TestCircuitBreaker_NonPositiveWindowKeepsCumulativeCount(t *testing.T) {
+	cb := newCircuitBreaker(2, time.Hour, 0)
+
+	cb.RecordFailure(mustAllow(t, cb))
+	time.Sleep(10 * time.Millisecond)
+	cb.RecordFailure(mustAllow(t, cb))
+
+	if state, _, _, _ := breakerSnapshot(cb); state != StateOpen {
+		t.Fatalf("state=%v, want open with non-positive window", state)
 	}
 }
 

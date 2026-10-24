@@ -55,10 +55,10 @@ func (e *PeerHTTPError) IsConfigError() bool {
 	}
 }
 
-// isPeerConfigError 判断是否为集群配置错误（401/403/404）
-func isPeerConfigError(err error) bool {
-	var peerErr *PeerHTTPError
-	return errors.As(err, &peerErr) && peerErr.IsConfigError()
+// IsKeyNotFound 表示对端明确告知该 key 不存在。这是正常未命中，不是故障，
+// 也不属于配置错误；注意与 404（对端未注册 group）区分。
+func (e *PeerHTTPError) IsKeyNotFound() bool {
+	return e.StatusCode == http.StatusGone
 }
 
 // =============================================================================
@@ -240,7 +240,13 @@ func (p *HTTPPool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		// 详细错误只写服务端日志，不返回给客户端
 		p.Log("get key %q failed: %v", key, err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		// 410 专用于「key 不存在」，与 404（group 未注册）区分开：
+		// 前者是正常未命中，后者才是集群配置错误。
+		if errors.Is(err, ErrKeyNotFound) {
+			http.Error(w, "key not found", http.StatusGone)
+		} else {
+			http.Error(w, "internal error", http.StatusInternalServerError)
+		}
 		return
 	}
 	//Proto序列化

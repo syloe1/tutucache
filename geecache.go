@@ -1,6 +1,7 @@
 package geecache
 
 import (
+	"errors"
 	"fmt"
 	pb "geecache/geecachepb"
 	"geecache/lru"
@@ -24,6 +25,9 @@ import (
 // Getter 内可以调用 Get 加载其他 key，但不能在加载 key K 的过程中（同一
 // goroutine 内）再次调用 Get(K)：这会形成等待自身的循环，此时会立即返回
 // ErrReentrantLoad。跨 goroutine 的循环依赖无法自动识别，仍需调用方避免。
+//
+// key 确实不存在时应返回 ErrKeyNotFound（支持 %w 包装），其他错误视为
+// 加载失败。两者在跨节点通信中的处理不同：未命中不会触发熔断或配置错误告警。
 type Getter interface {
 	// []byte 想一下byteview, 二进制
 	Get(key string) ([]byte, error)
@@ -32,6 +36,11 @@ type Getter interface {
 // ErrReentrantLoad 表示 Getter 在加载某个 key 时，又通过 Get 加载同一个 key。
 // 这种循环等待无法解开，因此立即返回错误而不是死锁。
 var ErrReentrantLoad = singleflight.ErrReentrant
+
+// ErrKeyNotFound 表示数据源中确实不存在该 key，而不是加载失败。
+// Getter 实现应在 key 不存在时返回它（可用 %w 包装）；服务端会把它映射为
+// 非故障响应，客户端据此区分「正常未命中」和「远端故障」。
+var ErrKeyNotFound = errors.New("geecache: key not found")
 
 // Go 函数类型 + 接口，**函数可以实现接口**，这个设计叫【函数适配器】
 // 定义一个函数类型
@@ -168,10 +177,15 @@ func (g *Group) load(key string) (value ByteView, err error) {
 					g.populateCache(key, value)
 					return value, nil
 				}
-				// 区分配置错误 / 临时故障
+				// 区分配置错误 / 未命中 / 临时故障
 				if isPeerConfigError(err) {
 					log.Printf("[ERROR] [GeeCache] peer configuration error: peer=%s key=%q: %v", peer, key, err)
 					return nil, err
+				}
+				// 对端明确表示 key 不存在：按普通未命中处理，回退本地。
+				// 这不是故障信号，既不计入熔断，也不打 WARN 日志。
+				if isPeerKeyNotFound(err) {
+					return g.getLocal(key)
 				}
 				// 5xx、网络超时、连接失败：临时故障，降级本地
 				log.Printf("[WARN] [GeeCache] remote load failed, falling back to local: peer=%s key=%q: %v", peer, key, err)
@@ -223,6 +237,11 @@ func (g *Group) getFromPeer(peer PeerGetter, key string) (ByteView, error) {
 			// 配置错误说明对端可达，不计入熔断失败；但 ticket 必须回填，
 			// 否则 HalfOpen 的探测名额会被永久占用。
 			breaker.RecordNeutral(ticket)
+		case isPeerKeyNotFound(err):
+			// key 不存在是正常响应，说明对端健康，同样不计入熔断失败。
+			// 归一化为 ErrKeyNotFound，让调用方在 HTTP/gRPC 下拿到一致的错误。
+			breaker.RecordNeutral(ticket)
+			return ByteView{}, ErrKeyNotFound
 		default:
 			breaker.RecordFailure(ticket) // 失败计数+1
 		}

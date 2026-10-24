@@ -73,8 +73,9 @@ func TestGRPCServer_Get_GroupNotFound(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected gRPC status error, got %v", err)
 	}
-	if st.Code() != codes.NotFound {
-		t.Fatalf("expected NotFound, got %v", st.Code())
+	// Group 未注册是配置错误；key 不存在才是 NotFound，两者必须区分。
+	if st.Code() != codes.FailedPrecondition {
+		t.Fatalf("expected FailedPrecondition, got %v", st.Code())
 	}
 }
 
@@ -101,10 +102,11 @@ func TestGRPCServer_Get_Success(t *testing.T) {
 	}
 }
 
+// ErrKeyNotFound 必须映射为 NotFound（正常未命中），而不是 Internal。
 func TestGRPCServer_Get_KeyNotFound(t *testing.T) {
 	NewGroup("test-miss", 1<<20, GetterFunc(
 		func(key string) ([]byte, error) {
-			return nil, fmt.Errorf("key %s not exist", key)
+			return nil, fmt.Errorf("key %s not exist: %w", key, ErrKeyNotFound)
 		},
 	))
 
@@ -112,6 +114,27 @@ func TestGRPCServer_Get_KeyNotFound(t *testing.T) {
 	_, err := svr.Get(context.TODO(), &pb.Request{Group: "test-miss", Key: "no-such-key"})
 	if err == nil {
 		t.Fatal("expected error for missing key")
+	}
+	if got := status.Code(err); got != codes.NotFound {
+		t.Fatalf("code = %v, want NotFound", got)
+	}
+}
+
+// 普通加载错误仍然是 Internal，保持与正常未命中区分。
+func TestGRPCServer_Get_LoadErrorIsInternal(t *testing.T) {
+	NewGroup("test-load-error", 1<<20, GetterFunc(
+		func(key string) ([]byte, error) {
+			return nil, fmt.Errorf("backend unavailable")
+		},
+	))
+
+	svr := &GRPCServer{}
+	_, err := svr.Get(context.TODO(), &pb.Request{Group: "test-load-error", Key: "k"})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if got := status.Code(err); got != codes.Internal {
+		t.Fatalf("code = %v, want Internal", got)
 	}
 }
 
