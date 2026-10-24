@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -37,6 +38,35 @@ func createGroup() *geecache.Group {
 			}
 			return nil, fmt.Errorf("%s not exist", key)
 		}))
+}
+
+// tlsSettings 是从环境变量解析出的节点间 TLS 配置。
+type tlsSettings struct {
+	enabled  bool
+	certFile string
+	keyFile  string
+	caFile   string
+}
+
+// tlsSettingsFromEnv 解析并校验 GEECACHE_CERT / GEECACHE_KEY / GEECACHE_CA。
+// cert 与 key 必须成对出现；只设置 CA 不会开启 TLS，属于配置错误。
+func tlsSettingsFromEnv() (tlsSettings, error) {
+	certFile := os.Getenv("GEECACHE_CERT")
+	keyFile := os.Getenv("GEECACHE_KEY")
+	caFile := os.Getenv("GEECACHE_CA")
+
+	if (certFile == "") != (keyFile == "") {
+		return tlsSettings{}, fmt.Errorf("GEECACHE_CERT and GEECACHE_KEY must be set together")
+	}
+	if certFile == "" && caFile != "" {
+		return tlsSettings{}, fmt.Errorf("GEECACHE_CA requires GEECACHE_CERT and GEECACHE_KEY")
+	}
+	return tlsSettings{
+		enabled:  certFile != "",
+		certFile: certFile,
+		keyFile:  keyFile,
+		caFile:   caFile,
+	}, nil
 }
 
 // serve 阻塞运行 HTTP 服务，正常关闭（ErrServerClosed）时返回 nil，其余错误原样返回。
@@ -75,7 +105,7 @@ func listenAddrFromURL(rawURL string) (string, error) {
 // selfURL 是节点对外公布的地址（peer 用它拨号）；listenAddr 是本机监听的 host:port。
 // 同步阶段的错误（TLS、服务发现）通过返回值交给 main，不在这里 os.Exit；
 // 服务运行期间的错误通过 serveErr 上报，由 main 触发统一的关闭流程。
-func startCacheServer(selfURL, listenAddr string, gee *geecache.Group, serveErr chan<- error) (*http.Server, *geecache.FileDiscovery, error) {
+func startCacheServer(selfURL, listenAddr string, gee *geecache.Group, tlsCfg tlsSettings, serveErr chan<- error) (*http.Server, *geecache.FileDiscovery, error) {
 	pool := geecache.NewHTTPPool(selfURL)
 
 	// 共享 Token 认证（环境变量 GEECACHE_TOKEN）
@@ -84,17 +114,35 @@ func startCacheServer(selfURL, listenAddr string, gee *geecache.Group, serveErr 
 		log.Println("shared token auth enabled")
 	}
 
-	// TLS 加密（环境变量 GEECACHE_CERT / GEECACHE_KEY / GEECACHE_CA）
-	certFile := os.Getenv("GEECACHE_CERT")
-	keyFile := os.Getenv("GEECACHE_KEY")
-	if certFile != "" && keyFile != "" {
-		caFile := os.Getenv("GEECACHE_CA")
+	if tlsCfg.enabled {
 		// TLS 配置失败属于启动错误，返回给 main 决定退出。
-		if err := pool.EnableTLS(certFile, keyFile, caFile); err != nil {
+		if err := pool.EnableTLS(tlsCfg.certFile, tlsCfg.keyFile, tlsCfg.caFile); err != nil {
 			return nil, nil, fmt.Errorf("enable TLS: %w", err)
 		}
-		log.Println("TLS enabled")
+		if tlsCfg.caFile != "" {
+			log.Println("TLS enabled with mTLS (client certificates required and verified)")
+		} else {
+			log.Println("TLS enabled")
+		}
 	}
+
+	// 校验 selfURL 的 scheme 与 TLS 模式一致：TLS 开启时必须注册 https://，
+	// 否则对端会按 http:// 拨号，握手必然失败。
+	u, err := url.Parse(selfURL)
+	if err != nil {
+		return nil, nil, fmt.Errorf("parse self URL %q: %w", selfURL, err)
+	}
+	if u.Host == "" {
+		return nil, nil, fmt.Errorf("parse self URL %q: missing host (want scheme://host:port)", selfURL)
+	}
+	wantScheme := "http"
+	if tlsCfg.enabled {
+		wantScheme = "https"
+	}
+	if !strings.EqualFold(u.Scheme, wantScheme) {
+		return nil, nil, fmt.Errorf("tls enabled=%t but self URL scheme is %q (want %q)", tlsCfg.enabled, u.Scheme, wantScheme)
+	}
+
 	// 先同步绑定端口，避免注册成功后才发现端口不可用。
 	ln, err := net.Listen("tcp", listenAddr)
 	if err != nil {
@@ -112,14 +160,15 @@ func startCacheServer(selfURL, listenAddr string, gee *geecache.Group, serveErr 
 
 	srv := &http.Server{
 		Handler: pool,
+		// TLS 未启用时该值为 nil，Serve 会直接处理明文连接。
+		TLSConfig: pool.TLSConfig(),
 	}
-	useTLS := pool.TLSConfig() != nil
 	// 在后台异步启动缓存节点的 HTTP 服务。
 	go func() {
 		log.Printf("geecache is running at %s", listenAddr)
 		var err error
-		if useTLS {
-			err = srv.ServeTLS(ln, certFile, keyFile)
+		if tlsCfg.enabled {
+			err = srv.ServeTLS(ln, tlsCfg.certFile, tlsCfg.keyFile)
 		} else {
 			err = srv.Serve(ln)
 		}
@@ -205,15 +254,27 @@ func run() error {
 	*/
 	// 每个端口对应一个地址
 	// 端口 -> 节点完整地址映射
-	portToAddr := map[int]string{
-		8001: "http://localhost:8001",
-		8002: "http://localhost:8002",
-		8003: "http://localhost:8003",
+	portToHost := map[int]string{
+		8001: "localhost:8001",
+		8002: "localhost:8002",
+		8003: "localhost:8003",
 	}
-	selfURL := portToAddr[port]
-	if selfURL == "" {
+	hostAddr, ok := portToHost[port]
+	if !ok {
 		return fmt.Errorf("unsupported port: %d (use 8001/8002/8003)", port)
 	}
+
+	// 解析并校验 TLS 环境变量，再用它决定节点注册/拨号使用的 scheme。
+	tlsCfg, err := tlsSettingsFromEnv()
+	if err != nil {
+		return fmt.Errorf("invalid TLS configuration: %w", err)
+	}
+	scheme := "http"
+	if tlsCfg.enabled {
+		scheme = "https"
+	}
+	selfURL := fmt.Sprintf("%s://%s", scheme, hostAddr)
+
 	// 监听地址从对外 URL 中解析出来：与 scheme 无关，http/https 都监听同一个 host:port。
 	listenAddr, err := listenAddrFromURL(selfURL)
 	if err != nil {
@@ -236,7 +297,7 @@ func run() error {
 		apiSrv = startAPIServer(apiListenAddr, gee, serveErr)
 	}
 	//启动**集群内部通信缓存节点服务**
-	cacheSrv, discovery, err := startCacheServer(selfURL, listenAddr, gee, serveErr)
+	cacheSrv, discovery, err := startCacheServer(selfURL, listenAddr, gee, tlsCfg, serveErr)
 	if err != nil {
 		// API 服务可能已经启动，先关闭再退出，避免端口和 goroutine 泄漏。
 		stopServers(apiSrv, nil)

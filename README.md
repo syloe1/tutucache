@@ -14,6 +14,7 @@ tutucache 是一个分布式内存缓存库，适用于需要**高并发读取**
 - **熔断降级**：三态熔断器（Closed/Open/HalfOpen），远程节点故障时快速失败并降级到本地回源
 - **服务发现**：`ServiceDiscovery` 接口 + 文件发现实现，动态更新节点列表、重建哈希环
 - **双传输 + Protobuf**：HTTP 与 gRPC 两种通道共用 `PeerPicker`/`PeerGetter` 接口，序列化统一 protobuf
+- **TLS / mTLS**：节点间 HTTPS 加密；配置 CA 后强制要求并校验客户端证书
 - **只读字节视图**：`ByteView` 确保缓存值不会被外部意外修改
 - **指标埋点**：按 Group 隔离的命中/未命中、本地/远程加载、淘汰计数，以及从 LRU 实时派生的内存占用 gauge（Prometheus 格式 `/metrics`，带 `group` 标签）
 - **健康检查**：`/health` 存活探针
@@ -191,7 +192,32 @@ value, err := group.Get("user:123")
 | `ServeHTTP(w, r)` | 实现 `http.Handler`，处理节点间请求 |
 | `StartDiscovery(d)` | 注册并监听节点变更 |
 | `SetSharedToken(token)` | 开启共享 token 认证 |
-| `EnableTLS(cert, key, ca)` | 开启 TLS/mTLS 加密 |
+| `EnableTLS(cert, key, ca)` | 开启 TLS；`ca` 非空时启用并强制校验 mTLS |
+
+### TLS / mTLS
+
+示例二进制通过环境变量配置节点间 TLS：
+
+| 环境变量 | 说明 |
+|----------|------|
+| `GEECACHE_CERT` / `GEECACHE_KEY` | 节点证书与私钥，必须同时设置 |
+| `GEECACHE_CA` | CA 证书；客户端用它验证对端服务端证书，服务端用它验证客户端证书 |
+
+```bash
+GEECACHE_CERT=node.crt GEECACHE_KEY=node.key GEECACHE_CA=ca.crt \
+  go run cmd/main.go -port=8001
+```
+
+要点：
+
+- 开启 TLS 后，节点注册和拨号地址自动使用 `https://`。`HTTPPool.Set` 会按当前 TLS
+  模式归一化 peer scheme 并去重，因此 `peers.json` 中残留的旧 `http://` 条目不会破坏互通。
+- `GEECACHE_CA` 为空时只加密、不要求客户端证书；此时客户端使用系统根证书验证服务端。
+  自签名证书需要把 CA 加入系统信任库，或直接设置 `GEECACHE_CA`（同时启用 mTLS）。
+- 节点证书的 SAN 必须覆盖 peer 实际拨号的地址（例如 `DNS:localhost`、`IP:127.0.0.1`）。
+  启用 mTLS 时，同一张证书同时用于服务端和客户端角色，因此还需要 `clientAuth` EKU。
+- 集群内所有节点应使用一致的 TLS 配置；切换 TLS 开关时建议清理旧的 `peers.json`。
+- TLS 只作用于节点间通信（`:8001`~`:8003`），前端 API 服务（`:9999`）仍为明文 HTTP。
 
 ## 许可证
 

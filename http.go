@@ -66,13 +66,15 @@ func isPeerConfigError(err error) bool {
 type HTTPPool struct {
 	self        string                 // 当前节点的地址，例如 "http://127.0.0.1:8001"
 	basePath    string                 // 路由前缀 /_geecache/
-	mu          sync.Mutex             // 保护 peers、httpGetters 的并发锁
+	mu          sync.Mutex             // 保护 peers、httpGetters 与 TLS/token 配置
 	peers       *consistenthash.Map    // 一致性哈希环，保存所有集群节点
-	peersList   []string               // 上一次 Set 的节点列表，用于跳过无变化的重建
+	peersList   []string               // 上一次 Set 的节点列表（已按当前 scheme 归一化）
 	httpGetters map[string]*httpGetter // key:节点地址，value:该节点的http客户端
-	// TLS / 认证配置（可选）
-	tlsConfig   *tls.Config
-	sharedToken string
+	// 服务端 TLS 配置，挂到本地 http.Server。EnableTLS 返回后视为只读。
+	serverTLSConfig *tls.Config
+	// 客户端 TLS 配置，供访问 peer 的 httpGetter 使用。非 nil 表示节点间通信走 https。
+	clientTLSConfig *tls.Config
+	sharedToken     string
 }
 
 func NewHTTPPool(self string) *HTTPPool {
@@ -82,43 +84,70 @@ func NewHTTPPool(self string) *HTTPPool {
 	}
 }
 
-// EnableTLS 加载证书，启用节点间 TLS 通信
-// caCertFile 为空时只加密不校验客户端证书；非空时开启 mTLS
+// EnableTLS 加载证书，启用节点间 TLS 通信。
+// caCertFile 为空时只加密、不要求客户端证书；非空时开启 mTLS：
+// 服务端要求并校验客户端证书，客户端用同一个 CA 校验服务端证书。
+//
+// 同一个证书同时用于服务端和客户端角色，因此证书 SAN 必须覆盖 peer 实际
+// 拨号的地址；启用 mTLS 时证书还需要 clientAuth EKU。
+//
+// 必须在 StartDiscovery/Set 之前调用。返回后两份配置都视为只读。
 func (p *HTTPPool) EnableTLS(certFile, keyFile, caCertFile string) error {
-	// 加载服务端证书 + 私钥对
+	// 加载节点证书 + 私钥对
 	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 	if err != nil {
 		return fmt.Errorf("load cert: %w", err)
 	}
 
-	cfg := &tls.Config{
-		Certificates: []tls.Certificate{cert}, //配置服务端证书列表
+	// 服务端和客户端角色必须使用两份独立的配置：
+	// 服务端需要 ClientCAs + ClientAuth 校验客户端证书；
+	// 客户端需要 RootCAs 校验服务端证书。
+	serverCfg := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+	}
+	clientCfg := &tls.Config{
+		Certificates: []tls.Certificate{cert},
 		MinVersion:   tls.VersionTLS12,
 	}
 
 	if caCertFile != "" {
-		// 如果传入CA证书路径，开启双向 mTLS
 		caCert, err := os.ReadFile(caCertFile)
 		if err != nil {
 			return fmt.Errorf("read CA cert: %w", err)
 		}
-		caCertPool := x509.NewCertPool()      // 创建CA证书池，可以存放多个可信根证书
-		caCertPool.AppendCertsFromPEM(caCert) // 把CA证书加入证书池
-		cfg.RootCAs = caCertPool
+		caCertPool := x509.NewCertPool()
+		if !caCertPool.AppendCertsFromPEM(caCert) {
+			return errors.New("append CA cert: invalid PEM")
+		}
+		// 服务端用 ClientCAs 校验客户端证书。
+		serverCfg.ClientCAs = caCertPool
+		serverCfg.ClientAuth = tls.RequireAndVerifyClientCert
+		// 客户端用 RootCAs 校验远端节点的服务端证书。
+		clientCfg.RootCAs = caCertPool
 	}
 
-	p.tlsConfig = cfg
+	p.mu.Lock()
+	p.serverTLSConfig = serverCfg
+	p.clientTLSConfig = clientCfg
+	p.mu.Unlock()
 	return nil
 }
 
-// SetSharedToken 设置共享 Token（最简单内网认证方式）
+// SetSharedToken 设置共享 Token（最简单内网认证方式）。
+// 必须在 StartDiscovery/Set 之前调用。
 func (p *HTTPPool) SetSharedToken(token string) {
+	p.mu.Lock()
 	p.sharedToken = token
+	p.mu.Unlock()
 }
 
-// TLSConfig 返回服务端 TLS 配置（供 main.go 的 http.Server 使用）
+// TLSConfig 返回服务端 TLS 配置（供 main.go 的 http.Server 使用）。
+// TLS 未启用时返回 nil；返回的配置视为只读，调用方不得修改。
 func (p *HTTPPool) TLSConfig() *tls.Config {
-	return p.tlsConfig
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.serverTLSConfig
 }
 
 func (p *HTTPPool) Log(format string, v ...interface{}) {
@@ -208,6 +237,26 @@ func (p *HTTPPool) Set(peers ...string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	// 按当前 TLS 模式统一 peer 的 scheme，并去重：
+	// peers.json 中可能同时残留 http:// 与 https:// 两种写法，归一化后会重复。
+	// 集群要求所有节点使用一致的 TLS 配置，因此以本节点的模式为准。
+	scheme := p.peerScheme()
+	self := normalizePeerURL(p.self, scheme)
+	normalized := make([]string, 0, len(peers))
+	seen := make(map[string]struct{}, len(peers))
+	for _, peer := range peers {
+		if peer == "" {
+			continue
+		}
+		peer = normalizePeerURL(peer, scheme)
+		if _, ok := seen[peer]; ok {
+			continue
+		}
+		seen[peer] = struct{}{}
+		normalized = append(normalized, peer)
+	}
+	peers = normalized
+
 	// FileDiscovery 每 3 秒回调一次。节点集合和认证/TLS 配置都没变时直接返回，
 	// 避免周期性地重建哈希环和全部 transport（重建会让 keep-alive 连接失去复用）。
 	if sameSlice(peers, p.peersList) && p.gettersCurrent() {
@@ -222,17 +271,17 @@ func (p *HTTPPool) Set(peers ...string) {
 	//key是节点地址字符串， value是访问远程节点的HTTP客户端
 	p.httpGetters = make(map[string]*httpGetter, len(peers))
 	for _, peer := range peers {
-		if peer == p.self {
+		if peer == self {
 			continue
 		}
 		// 拓扑变化时复用仍然存在的节点客户端：幸存节点的 transport 和
 		// keep-alive 连接可以继续使用，只有新增节点才需要新建客户端。
-		if getter, ok := oldGetters[peer]; ok && getter.matches(p.tlsConfig, p.sharedToken) {
+		if getter, ok := oldGetters[peer]; ok && getter.matches(p.clientTLSConfig, p.sharedToken) {
 			p.httpGetters[peer] = getter
 			continue
 		}
-		//peer 是`http://127.0.0.1:8001`，basePath 是`/geecache/`，得到 `http://127.0.0.1:8001/geecache/`
-		p.httpGetters[peer] = newHTTPGetter(peer+p.basePath, p.tlsConfig, p.sharedToken)
+		// peer 已经按当前 TLS 模式归一化为 http:// 或 https://，再拼上 basePath。
+		p.httpGetters[peer] = newHTTPGetter(peer+p.basePath, p.clientTLSConfig, p.sharedToken)
 	}
 	p.peersList = append([]string(nil), peers...)
 
@@ -245,15 +294,36 @@ func (p *HTTPPool) Set(peers ...string) {
 	}
 }
 
+// peerScheme 返回当前节点间通信使用的 URL scheme。
+// 调用方必须持有 p.mu。
+func (p *HTTPPool) peerScheme() string {
+	if p.clientTLSConfig != nil {
+		return "https"
+	}
+	return "http"
+}
+
+// normalizePeerURL 把 peer 地址的 scheme 改成当前节点间通信使用的 scheme。
+// 地址不合法或缺少 host 时原样返回，交给请求阶段报错。
+func normalizePeerURL(raw, scheme string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return raw
+	}
+	u.Scheme = scheme
+	return u.String()
+}
+
 // gettersCurrent 报告当前 httpGetters 是否已经与节点列表、TLS 和 token 配置一致。
 // 调用方必须持有 p.mu。
 func (p *HTTPPool) gettersCurrent() bool {
+	self := normalizePeerURL(p.self, p.peerScheme())
 	for _, peer := range p.peersList {
-		if peer == p.self {
+		if peer == self {
 			continue
 		}
 		getter, ok := p.httpGetters[peer]
-		if !ok || !getter.matches(p.tlsConfig, p.sharedToken) {
+		if !ok || !getter.matches(p.clientTLSConfig, p.sharedToken) {
 			return false
 		}
 	}
@@ -281,7 +351,8 @@ func (p *HTTPPool) PickPeer(key string) (PeerGetter, bool) {
 	if p.peers == nil {
 		return nil, false
 	}
-	if peer := p.peers.Get(key); peer != "" && peer != p.self {
+	self := normalizePeerURL(p.self, p.peerScheme())
+	if peer := p.peers.Get(key); peer != "" && peer != self {
 		p.Log("Pick peer %s", peer)
 		//取客户端
 		if getter, ok := p.httpGetters[peer]; ok {
@@ -298,10 +369,10 @@ var _ PeerPicker = (*HTTPPool)(nil)
 // =============================================================================
 // 远程节点HTTP客户端
 type httpGetter struct {
-	baseURL     string
-	httpClient  *http.Client
-	sharedToken string
-	tlsConfig   *tls.Config
+	baseURL         string
+	httpClient      *http.Client
+	sharedToken     string
+	clientTLSConfig *tls.Config
 }
 
 // newHTTPGetter 创建客户端（包内使用）
@@ -320,14 +391,14 @@ func newHTTPGetter(baseURL string, tlsCfg *tls.Config, sharedToken string) *http
 			Transport: transport,
 			Timeout:   2 * time.Second,
 		},
-		sharedToken: sharedToken,
-		tlsConfig:   tlsCfg,
+		sharedToken:     sharedToken,
+		clientTLSConfig: tlsCfg,
 	}
 }
 
 // matches 报告该客户端是否仍使用给定的 TLS/token 配置。
-func (h *httpGetter) matches(tlsCfg *tls.Config, sharedToken string) bool {
-	return h.tlsConfig == tlsCfg && h.sharedToken == sharedToken
+func (g *httpGetter) matches(clientTLS *tls.Config, token string) bool {
+	return g.clientTLSConfig == clientTLS && g.sharedToken == token
 }
 
 // close 关闭客户端的空闲 keep-alive 连接。正在进行的请求不受影响。
