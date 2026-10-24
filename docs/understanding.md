@@ -84,3 +84,4 @@ HalfOpen（半开，只放行探测请求）
 
 - 本项目：`NewCircuitBreaker(3, 10*time.Second)`，连续失败 3 次熔断、10 秒后尝试恢复。
 - 接入点：`getFromPeer` —— 熔断打开时直接快速失败，上层 `load` 自动降级到 `getLocal` 回源。
+- 隔离粒度：内置 `httpGetter`/`grpcGetter` 按 **(Group, peer)** 各持一个熔断器，一个坏节点不会熔断其他健康节点；熔断状态随 peer 客户端生命周期回收。

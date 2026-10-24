@@ -252,11 +252,13 @@ type Group struct {
     peers     PeerPicker           // 节点选择器（一致性哈希）
     loader    *singleflight.Group  // 合并并发请求
     defaultTTL time.Duration       // ★ 默认过期时间，0 表示永不过期
-    breaker   *CircuitBreaker      // ★ 远程节点熔断器
+    breaker   *CircuitBreaker      // ★ 兜底熔断器（仅自定义 PeerGetter）
 }
 ```
 
-`NewGroup` 里固定初始化熔断器 `NewCircuitBreaker(3, 10*time.Second)`（连续失败 3 次熔断、10 秒后尝试恢复）。
+`NewGroup` 里固定初始化兜底熔断器 `NewCircuitBreaker(3, 10*time.Second)`（连续失败 3 次熔断、10 秒后尝试恢复）。
+内置的 `httpGetter`/`grpcGetter` 实现 `PeerBreakerProvider`，按 **（Group, peer）** 各自持有熔断器：
+节点 A 的连续失败只会熔断发往 A 的请求，不会波及健康节点 B；节点下线时 getter 被丢弃，熔断状态随之回收。
 
 ### 5.3 Getter 接口 —— 函数式接口模式
 

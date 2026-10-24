@@ -399,6 +399,13 @@ type httpGetter struct {
 	httpClient      *http.Client
 	sharedToken     string
 	clientTLSConfig *tls.Config
+	// breakers 按 Group 隔离该 peer 的熔断状态；随 getter 生命周期创建和回收。
+	breakers peerBreakers
+}
+
+// BreakerFor 返回该 peer 在指定 Group 下的熔断器（实现 PeerBreakerProvider）。
+func (h *httpGetter) BreakerFor(group string) *CircuitBreaker {
+	return h.breakers.get(group)
 }
 
 // newHTTPGetter 创建客户端（包内使用）
@@ -480,4 +487,7 @@ func (h *httpGetter) Get(in *pb.Request, out *pb.Response) error {
 	return nil
 }
 
-var _ PeerGetter = (*httpGetter)(nil)
+var (
+	_ PeerGetter          = (*httpGetter)(nil)
+	_ PeerBreakerProvider = (*httpGetter)(nil)
+)
