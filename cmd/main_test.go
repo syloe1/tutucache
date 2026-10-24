@@ -233,6 +233,53 @@ func TestStartCacheServerAppliesTLSConfig(t *testing.T) {
 	}
 }
 
+// 回归测试 #19：两个 HTTP 服务端都必须配置读/写/空闲超时，
+// 否则慢速连接可以无限期占用 goroutine 和 socket（slowloris）。
+func TestStartCacheServerSetsTimeouts(t *testing.T) {
+	// peers.json 是相对路径，切到临时目录避免污染仓库。
+	t.Chdir(t.TempDir())
+
+	gee := geecache.NewGroup("startup-timeouts", 1<<10, geecache.GetterFunc(func(string) ([]byte, error) {
+		return nil, nil
+	}))
+
+	srv, discovery, err := startCacheServer("http://localhost:8001", "127.0.0.1:0", gee, tlsSettings{}, make(chan error, 2))
+	if err != nil {
+		t.Fatalf("startCacheServer() error: %v", err)
+	}
+	defer discovery.Close()
+	defer srv.Close()
+
+	assertServerTimeouts(t, srv)
+}
+
+func TestStartAPIServerSetsTimeouts(t *testing.T) {
+	gee := geecache.NewGroup("api-timeouts", 1<<10, geecache.GetterFunc(func(string) ([]byte, error) {
+		return nil, nil
+	}))
+
+	srv := startAPIServer("127.0.0.1:0", gee, make(chan error, 1))
+	defer srv.Close()
+
+	assertServerTimeouts(t, srv)
+}
+
+func assertServerTimeouts(t *testing.T, srv *http.Server) {
+	t.Helper()
+	if srv.ReadHeaderTimeout != serverReadHeaderTimeout {
+		t.Errorf("ReadHeaderTimeout = %v, want %v", srv.ReadHeaderTimeout, serverReadHeaderTimeout)
+	}
+	if srv.ReadTimeout != serverReadTimeout {
+		t.Errorf("ReadTimeout = %v, want %v", srv.ReadTimeout, serverReadTimeout)
+	}
+	if srv.WriteTimeout != serverWriteTimeout {
+		t.Errorf("WriteTimeout = %v, want %v", srv.WriteTimeout, serverWriteTimeout)
+	}
+	if srv.IdleTimeout != serverIdleTimeout {
+		t.Errorf("IdleTimeout = %v, want %v", srv.IdleTimeout, serverIdleTimeout)
+	}
+}
+
 // 服务运行时的错误必须上报到 serveErr 通道，由 main 触发统一的关闭流程。
 func TestStartAPIServerReportsServeError(t *testing.T) {
 	// 先占用端口制造 bind 冲突
