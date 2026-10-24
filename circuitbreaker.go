@@ -10,7 +10,7 @@ import (
 // CircuitBreaker — 熔断器，保护本节点不被故障远端拖垮
 //
 // 状态机：
-//   Closed ──连续N次失败──► Open ──timeout到期──► HalfOpen
+//   Closed ──窗口内N次失败──► Open ──timeout到期──► HalfOpen
 //     ▲                                              │
 //     └────── 探测成功 ◄─────────────────────────────┤
 //               探测失败 → 重新回到 Open
@@ -23,9 +23,13 @@ import (
 // =============================================================================
 
 const (
-	// 每个 (Group, peer) 熔断器的默认参数：连续失败 3 次熔断 10 秒。
+	// 每个 (Group, peer) 熔断器的默认参数：
+	// 在 failureWindow 内失败达到 3 次即熔断，冷却 10 秒后放行一个探测请求。
 	defaultBreakerFailureThreshold = 3
 	defaultBreakerTimeout          = 10 * time.Second
+	// defaultBreakerFailureWindow 是失败计数的滑动窗口。超过窗口的旧失败会被丢弃，
+	// 因此零星、间隔很长的失败不会累积到阈值（issue #17）。
+	defaultBreakerFailureWindow = 30 * time.Second
 )
 
 type State int
@@ -47,10 +51,11 @@ type Ticket struct {
 type CircuitBreaker struct {
 	mu            sync.Mutex
 	state         State
-	failureCount  int
-	failureThresh int           // 连续失败 N 次 → 熔断
-	timeout       time.Duration // 熔断多久后尝试恢复
-	lastFailure   time.Time     // 仅在进入 Open 时设置，冷却从这里开始计算
+	failureTimes  []time.Time   // 滑动窗口内的失败时间，长度即 failureCount
+	failureThresh int           // 窗口内失败 N 次 → 熔断
+	timeout       time.Duration // Open 冷却时长
+	failureWindow time.Duration // 失败计数滑动窗口
+	openedAt      time.Time     // 进入 Open 的时间，冷却从这里开始计算
 	generation    uint64        // 当前状态代数，从 1 开始，每次状态迁移自增
 	probeInFlight bool          // HalfOpen 探测名额是否已被占用
 }
@@ -74,11 +79,18 @@ func (p *peerBreakers) get(group string) *CircuitBreaker {
 
 // NewCircuitBreaker 创建熔断器，thresh 为失败阈值，timeout 为熔断恢复等待
 func NewCircuitBreaker(thresh int, timeout time.Duration) *CircuitBreaker {
+	return newCircuitBreaker(thresh, timeout, defaultBreakerFailureWindow)
+}
+
+// newCircuitBreaker 允许显式指定失败统计窗口，主要供测试注入毫秒级窗口，
+// 避免测试依赖 30 秒的默认值。
+func newCircuitBreaker(thresh int, timeout, failureWindow time.Duration) *CircuitBreaker {
 	return &CircuitBreaker{
 		state:         StateClosed,
 		generation:    1, // 从 1 开始，保证零值 Ticket 永远失效
 		failureThresh: thresh,
 		timeout:       timeout,
+		failureWindow: failureWindow,
 	}
 }
 
@@ -94,7 +106,7 @@ func (cb *CircuitBreaker) Allow() (Ticket, bool) {
 		return Ticket{generation: cb.generation}, true
 
 	case StateOpen:
-		if time.Since(cb.lastFailure) < cb.timeout {
+		if time.Since(cb.openedAt) < cb.timeout {
 			return Ticket{}, false // 冷却未到，拒绝
 		}
 		// 冷却到期：进入半开；探测名额在下面的公共逻辑中预约
@@ -127,7 +139,7 @@ func (cb *CircuitBreaker) RecordSuccess(t Ticket) {
 
 	switch cb.state {
 	case StateClosed:
-		cb.failureCount = 0
+		cb.failureTimes = nil
 
 	case StateHalfOpen:
 		// 当前代数 + HalfOpen 只可能是预约的探测票据
@@ -136,13 +148,14 @@ func (cb *CircuitBreaker) RecordSuccess(t Ticket) {
 		}
 		cb.probeInFlight = false
 		cb.state = StateClosed
-		cb.failureCount = 0
+		cb.failureTimes = nil
 		cb.generation++
 	}
 }
 
 // RecordNeutral 释放 HalfOpen 的探测名额，但不改变失败计数。
-// 用于「对端有明确响应、但属于配置错误」的场景：既不是远端故障，也不是成功。
+// 用于「对端有明确响应，但既不是成功也不是远端故障」的场景：
+// 配置错误、key 不存在（正常未命中）。
 // 探测名额必须释放，否则 HalfOpen 会永久卡住，后续请求全部静默降级。
 func (cb *CircuitBreaker) RecordNeutral(t Ticket) {
 	cb.mu.Lock()
@@ -154,9 +167,9 @@ func (cb *CircuitBreaker) RecordNeutral(t Ticket) {
 	cb.probeInFlight = false
 }
 
-// RecordFailure 请求失败时调用：递增连续失败计数，达到阈值进入熔断；
-// HalfOpen 探测失败则重新熔断，并从现在开始计算冷却。
-// 失效 ticket 既不计数，也不修改 lastFailure。
+// RecordFailure 请求失败时调用：把失败时间记入滑动窗口，窗口内失败达到阈值
+// 则进入熔断；HalfOpen 探测失败则重新熔断，并从现在开始计算冷却。
+// 失效 ticket 既不计数，也不修改 openedAt。
 func (cb *CircuitBreaker) RecordFailure(t Ticket) {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
@@ -167,10 +180,13 @@ func (cb *CircuitBreaker) RecordFailure(t Ticket) {
 
 	switch cb.state {
 	case StateClosed:
-		cb.failureCount++
-		if cb.failureCount >= cb.failureThresh {
+		now := time.Now()
+		cb.pruneFailureTimes(now)
+		cb.failureTimes = append(cb.failureTimes, now)
+
+		if len(cb.failureTimes) >= cb.failureThresh {
 			cb.state = StateOpen
-			cb.lastFailure = time.Now()
+			cb.openedAt = now
 			cb.generation++
 		}
 
@@ -181,7 +197,23 @@ func (cb *CircuitBreaker) RecordFailure(t Ticket) {
 		}
 		cb.probeInFlight = false
 		cb.state = StateOpen
-		cb.lastFailure = time.Now() // 重新计算冷却起点
+		cb.openedAt = time.Now() // 重新计算冷却起点
 		cb.generation++
+	}
+}
+
+// pruneFailureTimes 丢弃早于滑动窗口的失败记录。调用方必须持有 cb.mu。
+// 窗口非正时不做裁剪（退化为累计计数），避免配置错误导致熔断器永远无法打开。
+func (cb *CircuitBreaker) pruneFailureTimes(now time.Time) {
+	if cb.failureWindow <= 0 || len(cb.failureTimes) == 0 {
+		return
+	}
+	cutoff := now.Add(-cb.failureWindow)
+	i := 0
+	for i < len(cb.failureTimes) && cb.failureTimes[i].Before(cutoff) {
+		i++
+	}
+	if i > 0 {
+		cb.failureTimes = append([]time.Time(nil), cb.failureTimes[i:]...)
 	}
 }
