@@ -277,7 +277,8 @@ func (g *Group) TTL() time.Duration {
 // 注意：二者不是原子操作，Purge 不会等待在途加载完成，严格一致性需要调用方自行协调。
 //
 // cleanupInterval > 0 时，首次调用会启动后台过期清理循环；重复调用只更新 defaultTTL，不会重复启动 goroutine。
-// cleanupInterval 为 0 时不启动后台清理，仅依赖 Get 时的惰性删除。
+// cleanupInterval 为 0 时不启动后台清理：Get 仍会惰性删除过期条目，写入路径也会
+// 每次摊销扫描少量冷端条目，因此过期冷 key 不会永久占用 LRU 槽位。
 func (g *Group) SetTTL(ttl time.Duration, cleanupInterval time.Duration) {
 	g.groupMu.Lock()
 	g.defaultTTL = ttl

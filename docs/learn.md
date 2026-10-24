@@ -330,7 +330,8 @@ getLocal(key):
 ```go
 // SetTTL 设置默认过期时间并启动后台清理。
 // 仅对调用之后新写入的条目生效：已有条目的 expiresAt 在写入时固化，不会自动重算。
-// cleanupInterval 为 0 时不启动后台清理（仅依赖 Get 时的惰性删除）。
+// cleanupInterval 为 0 时不启动后台清理；Get 仍会惰性删除过期条目，
+// 写入路径也会每次摊销扫描少量冷端条目，过期冷 key 不会永久占用 LRU 槽位。
 func (g *Group) SetTTL(ttl time.Duration, cleanupInterval time.Duration) {
     g.groupMu.Lock()
     g.defaultTTL = ttl
