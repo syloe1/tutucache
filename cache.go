@@ -11,6 +11,12 @@ import (
 // 批与批之间会释放 c.mu，避免一次 O(n) 全量扫描长时间阻塞 get/add。
 const cleanupBatchSize = 1024
 
+// addExpiryScanLimit 是每次写入时顺带检查的冷端节点数。
+// 即使调用方没有启动后台清理循环（cleanupInterval == 0），写入路径也会以
+// 摊销方式回收过期冷 key：它们不会永久占住 LRU 槽位，最多在后续有限次写入
+// 后全部被清理。没有新写入时缓存本来就不会继续增长，因此不需要额外 goroutine。
+const addExpiryScanLimit = 2
+
 // 实例化LRU, 封装get add
 type cache struct {
 	mu         sync.Mutex
@@ -54,6 +60,9 @@ func (c *cache) add(key string, value ByteView, ttl time.Duration) {
 			c.lru = lru.New(c.cacheBytes)
 		}
 		evicted = c.lru.Add(key, value, ttl)
+		// 借写入路径摊销回收过期冷 key。没有后台清理循环时，这是唯一的
+		// 主动回收入口；摊销游标与后台全量清理相互独立。
+		evicted = append(evicted, c.lru.CleanupExpiredAmortized(addExpiryScanLimit)...)
 	}()
 	// 锁已释放，再执行淘汰回调。
 	c.handleEvictions(evicted)

@@ -31,9 +31,12 @@ type Cache struct {
 	ll       *list.List               // 双向链表：Front是最近访问，Back是最久未访问
 	cache    map[string]*list.Element // 哈希表，key映射链表节点，O(1)查找
 
-	// cleanupCursor 是下一次 CleanupExpiredBatch 继续扫描的位置（向 Front 方向）。
-	// 只由本包的删除逻辑和 CleanupExpiredBatch 维护，调用方加锁即可。
-	cleanupCursor *list.Element
+	// cleanupCursor 是下一次全量清理 CleanupExpiredBatch 继续扫描的位置（向 Front 方向）。
+	// amortizedCursor 是写入路径摊销清理 CleanupExpiredAmortized 的独立游标。
+	// 两者必须分开：写入会持续小步推进，如果共用游标，后台的一轮全量扫描会误以为
+	// 游标之前的节点“本轮已检查过”，从而漏掉扫描时尚未过期、之后才过期的条目。
+	cleanupCursor   *list.Element
+	amortizedCursor *list.Element
 }
 
 // entry 链表里面存储的单元，保存key、value、过期时间
@@ -70,6 +73,7 @@ func (c *Cache) Purge() {
 	c.nbytes = 0
 	// 链表已经重置，续扫游标必须失效；否则会继续遍历已脱离链表的旧节点。
 	c.cleanupCursor = nil
+	c.amortizedCursor = nil
 }
 
 // removeElement 从链表和 map 中删除节点，更新占用并维护续扫游标。
@@ -84,6 +88,9 @@ func (c *Cache) removeElement(e *list.Element) *entry {
 		// 游标指向的节点被其他路径（惰性过期/容量淘汰）删除了，
 		// 退回到前一个节点，下一次扫描从这里继续。
 		c.cleanupCursor = prev
+	}
+	if c.amortizedCursor == e {
+		c.amortizedCursor = prev
 	}
 	return kv
 }
@@ -188,11 +195,26 @@ func (c *Cache) CleanupExpired() []EvictItem {
 // 扫描期间被移动或新增的节点可能留到下一轮处理，不保证本轮一定覆盖。
 // 与其他方法一样，调用方必须自行同步并发访问。
 func (c *Cache) CleanupExpiredBatch(limit int) (evicted []EvictItem, finished bool) {
+	return c.cleanupExpiredFrom(&c.cleanupCursor, limit)
+}
+
+// CleanupExpiredAmortized 从独立的摊销游标继续向链表头部方向扫描，
+// 最多检查 limit 个节点并删除其中已过期的条目（limit <= 0 时按 1 处理）。
+//
+// 供写入路径调用，让没有后台清理循环的缓存也能逐步回收过期冷 key。
+// 它不推进 CleanupExpiredBatch 的游标，因此不会破坏后台一轮全量扫描的覆盖范围。
+func (c *Cache) CleanupExpiredAmortized(limit int) []EvictItem {
+	evicted, _ := c.cleanupExpiredFrom(&c.amortizedCursor, limit)
+	return evicted
+}
+
+// cleanupExpiredFrom 是两种清理共用的扫描逻辑，cursor 由调用方指定。
+func (c *Cache) cleanupExpiredFrom(cursor **list.Element, limit int) (evicted []EvictItem, finished bool) {
 	if limit <= 0 {
 		limit = 1
 	}
 	now := time.Now()
-	e := c.cleanupCursor
+	e := *cursor
 	if e == nil {
 		e = c.ll.Back()
 	}
@@ -207,6 +229,6 @@ func (c *Cache) CleanupExpiredBatch(limit int) (evicted []EvictItem, finished bo
 		}
 		e = prev
 	}
-	c.cleanupCursor = e
+	*cursor = e
 	return evicted, e == nil
 }

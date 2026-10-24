@@ -250,6 +250,30 @@ func TestCleanupRecordsEvictions(t *testing.T) {
 	}
 }
 
+// 回归 #31：没有后台清理循环时，写入路径也要摊销回收过期冷 key。
+func TestAddReclaimsExpiredColdKeysWithoutCleanup(t *testing.T) {
+	m := NewMetrics()
+	c := &cache{
+		cacheBytes: 1 << 20,
+		onEvicted:  func(lru.EvictItem) { m.RecordEviction() },
+	}
+	c.add("cold", ByteView{b: []byte("v")}, 10*time.Millisecond)
+	time.Sleep(20 * time.Millisecond)
+
+	// 一次写入只能扫描有限的冷端节点，但足以回收这个唯一的过期条目。
+	c.add("live", ByteView{b: []byte("v")}, 0)
+
+	c.mu.Lock()
+	n := c.lru.Len()
+	c.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("lru len=%d, want 1 (expired cold key should be reclaimed by Add)", n)
+	}
+	if got := m.Snapshot().Evictions; got != 1 {
+		t.Fatalf("evictions=%d, want 1", got)
+	}
+}
+
 func TestCleanupExpiredProcessesMultipleBatches(t *testing.T) {
 	c := &cache{cacheBytes: 1 << 20}
 	total := cleanupBatchSize*2 + 17

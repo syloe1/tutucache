@@ -176,7 +176,7 @@ value, err := group.Get("user:123")
 | `GetGroup(name)` | 获取已创建的缓存组 |
 | `Get(key)` | 获取缓存值（自动处理 miss） |
 | `RegisterPeers(peers)` | 注册远程节点 |
-| `SetTTL(ttl, cleanupInterval)` | 设置默认过期时间，仅对之后新写入的条目生效；首次传入非零 `cleanupInterval` 时启动后台清理，重复调用不会重复启动 |
+| `SetTTL(ttl, cleanupInterval)` | 设置默认过期时间，仅对之后新写入的条目生效；首次传入非零 `cleanupInterval` 时启动后台清理，重复调用不会重复启动；`cleanupInterval == 0` 时仍会由 Get 惰性删除，并在每次写入时摊销回收少量过期冷 key |
 | `Purge()` | 清空本机该 Group 的本地缓存（含未过期条目）；不影响远程节点，也不等待在途加载 |
 | `Close()` | 停止后台清理循环（可重复调用），不影响已获取的缓存数据 |
 

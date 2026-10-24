@@ -800,6 +800,38 @@ func TestGroupSetTTLIsForwardLookingAndPurge(t *testing.T) {
 	}
 }
 
+// 回归 #31：SetTTL(ttl, 0) 不启动后台清理时，过期冷 key 仍会随后续写入被回收，
+// 不会永久占用 LRU 槽位。
+func TestGroupExpiredColdKeyReclaimedWithoutCleanup(t *testing.T) {
+	const name = "expired-cold-no-cleanup"
+	g := NewGroup(name, 1<<20, GetterFunc(func(k string) ([]byte, error) {
+		return []byte(k), nil
+	}))
+	t.Cleanup(func() {
+		mu.Lock()
+		delete(groups, name)
+		mu.Unlock()
+	})
+
+	g.SetTTL(10*time.Millisecond, 0) // 明确不启动后台清理
+	if _, err := g.Get("cold"); err != nil {
+		t.Fatalf("Get(cold): %v", err)
+	}
+	time.Sleep(20 * time.Millisecond)
+
+	// 写入 "other" 会顺带摊销扫描冷端，删除已经过期的 "cold"。
+	if _, err := g.Get("other"); err != nil {
+		t.Fatalf("Get(other): %v", err)
+	}
+
+	g.mainCache.mu.Lock()
+	n := g.mainCache.lru.Len()
+	g.mainCache.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("lru len=%d, want 1 (expired cold key should not stay resident)", n)
+	}
+}
+
 // TestGroupPurgeConcurrentWithGet -race 下无数据竞争
 func TestGroupPurgeConcurrentWithGet(t *testing.T) {
 	g := NewGroup("purge-race", 1<<20, GetterFunc(func(k string) ([]byte, error) {

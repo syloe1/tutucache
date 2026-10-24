@@ -48,7 +48,7 @@ Group.Get(key)
 - Group 是独立缓存命名空间，对外查询入口，串联：本地缓存查询 → 分布式节点路由 → 回源。
 - **singleflight 防击穿**：同一个 key 大量并发 miss 时，只放行 1 个协程去回源，其余阻塞等待复用结果。
 - **熔断器容错**：远程节点连续失败 N 次后熔断，跳过远程直接降级到本地回源。
-- **SetTTL(ttl, cleanupInterval)**：设默认过期时间（只对之后写入的条目生效）+ 可选启动后台清理；**Purge()** 清空本机该 Group 的本地缓存，切换 TTL 时可配合使用。
+- **SetTTL(ttl, cleanupInterval)**：设默认过期时间（只对之后写入的条目生效）+ 可选启动后台清理；`cleanupInterval == 0` 时仍由 Get 惰性删除，并在写入时摊销回收过期冷 key；**Purge()** 清空本机该 Group 的本地缓存，切换 TTL 时可配合使用。
 
 ### 第 6 层：节点通信（`http.go` + `peers_grpc.go`）
 - **PeerPicker 接口**做节点管理：`PickPeer(key)` 用一致性哈希选节点。
