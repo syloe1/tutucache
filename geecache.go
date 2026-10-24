@@ -161,6 +161,10 @@ func (g *Group) load(key string) (value ByteView, err error) {
 			if peer, ok := p.PickPeer(key); ok {
 				//发起HTTP请求从远程节点获取数据
 				if value, err = g.getFromPeer(peer, key); err == nil {
+					// 与 getLocal 保持一致：远端命中的值也回填本地缓存（遵循 defaultTTL），
+					// 否则归属远端的 key 每次顺序读取都要重新走网络。
+					// 注意这会有意让远端值在本机多存一份，直到本地 TTL 到期。
+					g.populateCache(key, value)
 					return value, nil
 				}
 				// 区分配置错误 / 临时故障
