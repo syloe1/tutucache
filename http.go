@@ -271,9 +271,8 @@ func (p *HTTPPool) Set(peers ...string) {
 		return
 	}
 
-	//创建一致性哈希环
-	p.peers = consistenthash.New(defaultReplicas, nil)
-	p.peers.Add(peers...) //把所有集群真实节点，加到哈希环上
+	// 按差集增量更新哈希环：只删除下线节点、添加新增节点，避免整环重建。
+	p.peers = updateRing(p.peers, defaultReplicas, p.peersList, peers)
 
 	oldGetters := p.httpGetters
 	//key是节点地址字符串， value是访问远程节点的HTTP客户端

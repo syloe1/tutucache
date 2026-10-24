@@ -2,9 +2,11 @@ package geecache
 
 import (
 	"fmt"
+	"geecache/consistenthash"
 	pb "geecache/geecachepb"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"sync/atomic"
 	"testing"
 
@@ -127,6 +129,33 @@ func TestPeerHTTPKeyRoundTrip(t *testing.T) {
 				t.Errorf("key %q round-tripped as %q", key, got)
 			}
 		})
+	}
+}
+
+// 回归：拓扑变化时只按差集增删节点，不重建整环。
+func TestHTTPPoolSetUpdatesRingIncrementally(t *testing.T) {
+	p := NewHTTPPool("http://self")
+	p.Set("http://a", "http://b", "http://c")
+	ring := p.peers
+
+	p.Set("http://a", "http://c", "http://d")
+
+	if p.peers != ring {
+		t.Fatal("ring was rebuilt instead of updated in place")
+	}
+
+	// 增量更新后的路由结果应与用同样节点重建的环一致。
+	ref := consistenthash.New(defaultReplicas, nil)
+	ref.Add("http://a", "http://c", "http://d")
+	for i := 0; i < 1000; i++ {
+		key := "key-" + strconv.Itoa(i)
+		got, want := p.peers.Get(key), ref.Get(key)
+		if got == "http://b" {
+			t.Fatalf("key %q still routes to removed peer http://b", key)
+		}
+		if got != want {
+			t.Fatalf("key %q routes to %q, want %q", key, got, want)
+		}
 	}
 }
 

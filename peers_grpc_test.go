@@ -3,7 +3,9 @@ package geecache
 import (
 	"context"
 	"fmt"
+	"geecache/consistenthash"
 	"net"
+	"strconv"
 	"testing"
 	"time"
 
@@ -318,6 +320,32 @@ func TestGRPCPool_Set_ReuseExistingGetter(t *testing.T) {
 	}
 	if got := new9001.conn.GetState(); got == connectivity.Shutdown {
 		t.Fatalf("survived conn state = %v, should not be shutdown", got)
+	}
+}
+
+// 回归：拓扑变化时只按差集增删节点，不重建整环。
+func TestGRPCPool_SetUpdatesRingIncrementally(t *testing.T) {
+	p := NewGRPCPool("localhost:9000")
+	p.Set("localhost:9001", "localhost:9002")
+	ring := p.peers
+
+	p.Set("localhost:9001", "localhost:9003")
+
+	if p.peers != ring {
+		t.Fatal("ring was rebuilt instead of updated in place")
+	}
+
+	ref := consistenthash.New(defaultGRPCReplicas, nil)
+	ref.Add("localhost:9001", "localhost:9003")
+	for i := 0; i < 1000; i++ {
+		key := "key-" + strconv.Itoa(i)
+		got, want := p.peers.Get(key), ref.Get(key)
+		if got == "localhost:9002" {
+			t.Fatalf("key %q still routes to removed peer localhost:9002", key)
+		}
+		if got != want {
+			t.Fatalf("key %q routes to %q, want %q", key, got, want)
+		}
 	}
 }
 
