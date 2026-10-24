@@ -1,6 +1,8 @@
 package geecache
 
 import (
+	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
@@ -142,6 +144,23 @@ func (p *HTTPPool) SetSharedToken(token string) {
 	p.mu.Unlock()
 }
 
+// authorized 校验请求携带的共享 token；未配置 token 时不做鉴权。
+//
+// 比较走 SHA-256 摘要 + subtle.ConstantTimeCompare：两者都是固定 32 字节，
+// 不会像字符串 != 那样在前缀不匹配时提前返回，避免通过响应时间逐字节
+// 猜测 token；先取摘要也避免了 ConstantTimeCompare 在长度不同时提前返回。
+func (p *HTTPPool) authorized(got string) bool {
+	p.mu.Lock()
+	want := p.sharedToken
+	p.mu.Unlock()
+	if want == "" {
+		return true
+	}
+	gotHash := sha256.Sum256([]byte(got))
+	wantHash := sha256.Sum256([]byte(want))
+	return subtle.ConstantTimeCompare(gotHash[:], wantHash[:]) == 1
+}
+
 // TLSConfig 返回服务端 TLS 配置（供 main.go 的 http.Server 使用）。
 // TLS 未启用时返回 nil；返回的配置视为只读，调用方不得修改。
 func (p *HTTPPool) TLSConfig() *tls.Config {
@@ -170,8 +189,8 @@ func (p *HTTPPool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 节点间通信 — 校验共享 token
-	if p.sharedToken != "" && r.Header.Get(SharedTokenHeader) != p.sharedToken {
+	// 节点间通信 — 校验共享 token（恒定时间比较，避免时序侧信道）
+	if !p.authorized(r.Header.Get(SharedTokenHeader)) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
