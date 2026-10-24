@@ -189,7 +189,7 @@ func TestGRPCIntegration_FullRoundTrip(t *testing.T) {
 	serverPool := NewGRPCPool(serverAddr)
 
 	// 创建带业务数据的 Group
-	NewGroup("scores", 1<<20, GetterFunc(
+	NewGroup("scores-grpc", 1<<20, GetterFunc(
 		func(key string) ([]byte, error) {
 			db := map[string]string{"Tom": "630", "Jack": "589"}
 			if v, ok := db[key]; ok {
@@ -218,7 +218,7 @@ func TestGRPCIntegration_FullRoundTrip(t *testing.T) {
 		t.Fatal("expected to pick peer for key Tom")
 	}
 
-	req := &pb.Request{Group: "scores", Key: "Tom"}
+	req := &pb.Request{Group: "scores-grpc", Key: "Tom"}
 	resp := &pb.Response{}
 	if err := getter.Get(req, resp); err != nil {
 		t.Fatalf("gRPC Get failed: %v", err)

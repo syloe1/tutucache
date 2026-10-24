@@ -89,6 +89,9 @@ var (
 	groups = make(map[string]*Group)
 )
 
+// NewGroup 创建一个命名的缓存组。name 在进程内全局唯一；
+// 重复创建同名 Group 会 panic（与 RegisterPeers 的重复注册一致），
+// 不会静默覆盖已有 Group 及其缓存、熔断器和指标。
 func NewGroup(name string, cacheBytes int64, getter Getter) *Group {
 	if getter == nil {
 		panic("nil Getter")
@@ -100,6 +103,10 @@ func NewGroup(name string, cacheBytes int64, getter Getter) *Group {
 	}
 	mu.Lock()
 	defer mu.Unlock()
+	// 重名校验
+	if _, exists := groups[name]; exists {
+		panic(fmt.Sprintf("geecache: NewGroup called twice with the same name: %q", name))
+	}
 	m := NewMetrics()
 	g := &Group{
 		name:    name,

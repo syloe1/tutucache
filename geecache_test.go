@@ -500,7 +500,7 @@ func TestHTTPProtoRoundTrip(t *testing.T) {
 
 func TestGet(t *testing.T) {
 	loadCounts := make(map[string]int, len(db))
-	gee := NewGroup("scores", 2<<10, GetterFunc(
+	gee := NewGroup("scores-lru", 2<<10, GetterFunc(
 		func(key string) ([]byte, error) {
 			log.Println("[SlowDB] search key", key)
 			if v, ok := db[key]; ok {
@@ -790,4 +790,32 @@ func TestGroupPurgeConcurrentWithGet(t *testing.T) {
 		}
 	}()
 	wg.Wait()
+}
+
+// 回归 #28：同名 Group 必须 fail fast，且不能覆盖已经注册的实例。
+func TestNewGroupDuplicateNamePanics(t *testing.T) {
+	const name = "dup-test"
+	g1 := NewGroup(name, 1024, GetterFunc(func(string) ([]byte, error) { return nil, nil }))
+	// 测试自己占用了全局注册表里的名字，跑完必须清理，保证 -count 重跑不受影响。
+	t.Cleanup(func() {
+		mu.Lock()
+		delete(groups, name)
+		mu.Unlock()
+	})
+
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("NewGroup with a duplicate name did not panic")
+		}
+		want := `geecache: NewGroup called twice with the same name: "dup-test"`
+		if got, ok := r.(string); !ok || got != want {
+			t.Fatalf("panic = %v (%T), want %q", r, r, want)
+		}
+		if got := GetGroup(name); got != g1 {
+			t.Fatal("duplicate NewGroup replaced the existing group")
+		}
+	}()
+
+	NewGroup(name, 1024, GetterFunc(func(string) ([]byte, error) { return nil, nil }))
 }

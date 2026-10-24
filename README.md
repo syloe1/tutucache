@@ -172,7 +172,7 @@ value, err := group.Get("user:123")
 
 | 方法 | 说明 |
 |------|------|
-| `NewGroup(name, cacheBytes, getter)` | 创建缓存组；`cacheBytes` 为 `0` 表示不限制内存，负数会 panic |
+| `NewGroup(name, cacheBytes, getter)` | 创建缓存组；`cacheBytes` 为 `0` 表示不限制内存，负数会 panic；同名重复创建会 panic |
 | `GetGroup(name)` | 获取已创建的缓存组 |
 | `Get(key)` | 获取缓存值（自动处理 miss） |
 | `RegisterPeers(peers)` | 注册远程节点 |
