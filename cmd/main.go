@@ -75,7 +75,7 @@ func listenAddrFromURL(rawURL string) (string, error) {
 // selfURL 是节点对外公布的地址（peer 用它拨号）；listenAddr 是本机监听的 host:port。
 // 同步阶段的错误（TLS、服务发现）通过返回值交给 main，不在这里 os.Exit；
 // 服务运行期间的错误通过 serveErr 上报，由 main 触发统一的关闭流程。
-func startCacheServer(selfURL, listenAddr string, gee *geecache.Group, serveErr chan<- error) (*http.Server, error) {
+func startCacheServer(selfURL, listenAddr string, gee *geecache.Group, serveErr chan<- error) (*http.Server, *geecache.FileDiscovery, error) {
 	pool := geecache.NewHTTPPool(selfURL)
 
 	// 共享 Token 认证（环境变量 GEECACHE_TOKEN）
@@ -91,29 +91,39 @@ func startCacheServer(selfURL, listenAddr string, gee *geecache.Group, serveErr 
 		caFile := os.Getenv("GEECACHE_CA")
 		// TLS 配置失败属于启动错误，返回给 main 决定退出。
 		if err := pool.EnableTLS(certFile, keyFile, caFile); err != nil {
-			return nil, fmt.Errorf("TLS setup: %w", err)
+			return nil, nil, fmt.Errorf("enable TLS: %w", err)
 		}
 		log.Println("TLS enabled")
 	}
-
-	// 服务发现
+	// 先同步绑定端口，避免注册成功后才发现端口不可用。
+	ln, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		return nil, nil, fmt.Errorf("listen on %s: %w", listenAddr, err)
+	}
+	// 端口绑定成功后再注册，确保 peers.json 中不会留下起不来的节点。
 	discovery := geecache.NewFileDiscovery(selfURL, peersFile)
-	// 给HTTPPool绑定服务发现
+	// 给 HTTPPool 绑定服务发现。
 	if err := pool.StartDiscovery(discovery); err != nil {
-		return nil, fmt.Errorf("discovery register: %w", err)
+		_ = ln.Close()
+		return nil, nil, fmt.Errorf("register with discovery: %w", err)
 	}
 	// 给Group注册 [节点选择器PeerPicker]
 	gee.RegisterPeers(pool)
 
 	srv := &http.Server{
-		Addr:    listenAddr,
 		Handler: pool,
 	}
-	//在后台异步启动缓存节点的 HTTP 服务
+	useTLS := pool.TLSConfig() != nil
+	// 在后台异步启动缓存节点的 HTTP 服务。
 	go func() {
 		log.Printf("geecache is running at %s", listenAddr)
-		useTLS := pool.TLSConfig() != nil
-		if err := serve(srv, useTLS, certFile, keyFile); err != nil {
+		var err error
+		if useTLS {
+			err = srv.ServeTLS(ln, certFile, keyFile)
+		} else {
+			err = srv.Serve(ln)
+		}
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			// 运行错误交给 main，由它触发与信号相同的关闭流程。
 			serveErr <- fmt.Errorf("geecache server: %w", err)
 			return
@@ -121,7 +131,7 @@ func startCacheServer(selfURL, listenAddr string, gee *geecache.Group, serveErr 
 		log.Printf("geecache server %s stopped", listenAddr)
 	}()
 
-	return srv, nil
+	return srv, discovery, nil
 }
 
 // startAPIServer 启动前端 API 服务；listenAddr 是本机监听的 host:port。
@@ -226,7 +236,7 @@ func run() error {
 		apiSrv = startAPIServer(apiListenAddr, gee, serveErr)
 	}
 	//启动**集群内部通信缓存节点服务**
-	cacheSrv, err := startCacheServer(selfURL, listenAddr, gee, serveErr)
+	cacheSrv, discovery, err := startCacheServer(selfURL, listenAddr, gee, serveErr)
 	if err != nil {
 		// API 服务可能已经启动，先关闭再退出，避免端口和 goroutine 泄漏。
 		stopServers(apiSrv, nil)
@@ -247,7 +257,11 @@ func run() error {
 	case shutdownCause = <-serveErr:
 		log.Printf("server runtime error: %v, starting graceful shutdown...", shutdownCause)
 	}
-
+	// 先停止 Watch/心跳，再注销；否则心跳会把刚删除的节点重新写回。
+	discovery.Close()
+	if err := discovery.Unregister(selfURL); err != nil {
+		log.Printf("[WARN] failed to unregister %s: %v", selfURL, err)
+	}
 	stopServers(apiSrv, cacheSrv)
 	// 停止 Group 的后台清理循环（若通过 SetTTL 启动过）。
 	gee.Close()

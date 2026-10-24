@@ -128,7 +128,7 @@ func TestStartCacheServerTLSFailureReturnsError(t *testing.T) {
 		return nil, nil
 	}))
 
-	_, err := startCacheServer("http://localhost:8001", "127.0.0.1:0", gee, make(chan error, 2))
+	_, _, err := startCacheServer("http://localhost:8001", "127.0.0.1:0", gee, make(chan error, 2))
 	if err == nil {
 		t.Fatal("expected error when TLS cert cannot be loaded, got nil")
 	}

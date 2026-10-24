@@ -1,19 +1,15 @@
 #!/bin/bash
-# trap: 收到退出信号时，清理产物并优雅关闭所有子进程
 cleanup() {
-    echo '[stop] shutting down...'
-    # 先删产物（运行中的进程已把二进制加载进内存，可安全删除）
-    rm -f server peers.json
-    # 给后台服务发 SIGTERM 触发优雅关闭（只杀子进程，不杀脚本自身）
     local pids
     pids=$(jobs -p)
     if [ -n "$pids" ]; then
         kill $pids 2>/dev/null || true
+        wait 2>/dev/null || true
     fi
-    wait 2>/dev/null || true
-    echo '[stop] done'
+    rm -f server
+    # peers.json 不在这里删除，交给节点的 Unregister，方便验证注销结果。
 }
-trap cleanup EXIT
+trap cleanup EXIT SIGINT SIGTERM
 
 set -e
 
