@@ -20,6 +20,14 @@ import (
 const (
 	peersFile = "peers.json"
 	apiURL    = "http://localhost:9999"
+
+	// HTTP 服务端超时：防止 slowloris / 慢连接无限期占用 goroutine 和 socket。
+	// WriteTimeout 需明显大于 peer 客户端的 2s 请求超时（见 http.go），
+	// 给远程回源和较慢的本地 getter 留出余量。
+	serverReadHeaderTimeout = 5 * time.Second
+	serverReadTimeout       = 10 * time.Second
+	serverWriteTimeout      = 10 * time.Second
+	serverIdleTimeout       = 60 * time.Second
 )
 
 var db = map[string]string{
@@ -67,6 +75,18 @@ func tlsSettingsFromEnv() (tlsSettings, error) {
 		keyFile:  keyFile,
 		caFile:   caFile,
 	}, nil
+}
+
+// newHTTPServer 构造带统一超时配置的 HTTP 服务端。
+// 节点服务与 API 服务共用，避免其中一个入口漏配超时而重新引入 slowloris 面。
+func newHTTPServer(handler http.Handler) *http.Server {
+	return &http.Server{
+		Handler:           handler,
+		ReadHeaderTimeout: serverReadHeaderTimeout,
+		ReadTimeout:       serverReadTimeout,
+		WriteTimeout:      serverWriteTimeout,
+		IdleTimeout:       serverIdleTimeout,
+	}
 }
 
 // serve 阻塞运行 HTTP 服务，正常关闭（ErrServerClosed）时返回 nil，其余错误原样返回。
@@ -158,11 +178,9 @@ func startCacheServer(selfURL, listenAddr string, gee *geecache.Group, tlsCfg tl
 	// 给Group注册 [节点选择器PeerPicker]
 	gee.RegisterPeers(pool)
 
-	srv := &http.Server{
-		Handler: pool,
-		// TLS 未启用时该值为 nil，Serve 会直接处理明文连接。
-		TLSConfig: pool.TLSConfig(),
-	}
+	srv := newHTTPServer(pool)
+	// TLS 未启用时该值为 nil，Serve 会直接处理明文连接。
+	srv.TLSConfig = pool.TLSConfig()
 	// 在后台异步启动缓存节点的 HTTP 服务。
 	go func() {
 		log.Printf("geecache is running at %s", listenAddr)
@@ -199,10 +217,8 @@ func startAPIServer(listenAddr string, gee *geecache.Group, serveErr chan<- erro
 			w.Write(view.ByteSlice())
 		}))
 
-	srv := &http.Server{
-		Addr:    listenAddr,
-		Handler: mux,
-	}
+	srv := newHTTPServer(mux)
+	srv.Addr = listenAddr
 
 	//新开 goroutine 异步启动 API 服务：
 	go func() {
