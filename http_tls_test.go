@@ -151,6 +151,41 @@ func testNodeCert(t *testing.T, ca *testCA, dir string) issuedCert {
 	)
 }
 
+// 回归 #18：EnableTLS 在 Set 之后调用时，已有 peer 的 getter 必须立即
+// 从 http 切换到 https，而不是等下一次 Set。
+func TestEnableTLSRebuildsGettersImmediately(t *testing.T) {
+	dir := t.TempDir()
+	ca := newTestCA(t)
+	node := testNodeCert(t, ca, dir)
+
+	p := NewHTTPPool("http://localhost:8001")
+	p.Set("http://localhost:8002")
+
+	oldGetter := p.httpGetters["http://localhost:8002"]
+	if oldGetter == nil {
+		t.Fatal("plaintext getter was not created")
+	}
+	tr := replaceTransport(oldGetter)
+
+	if err := p.EnableTLS(node.certFile, node.keyFile, ca.writePEM(t, dir)); err != nil {
+		t.Fatalf("EnableTLS: %v", err)
+	}
+
+	if _, ok := p.httpGetters["http://localhost:8002"]; ok {
+		t.Error("plaintext getter still present after enabling TLS")
+	}
+	newGetter := p.httpGetters["https://localhost:8002"]
+	if newGetter == nil || newGetter == oldGetter {
+		t.Fatal("getter was not rebuilt for https after enabling TLS")
+	}
+	if newGetter.clientTLSConfig == nil {
+		t.Error("rebuilt getter has no TLS config")
+	}
+	if n := tr.closeIdle.Load(); n != 1 {
+		t.Errorf("closeIdle called %d times for stale plaintext getter, want 1", n)
+	}
+}
+
 func TestEnableTLSSplitsServerAndClientConfigs(t *testing.T) {
 	dir := t.TempDir()
 	ca := newTestCA(t)

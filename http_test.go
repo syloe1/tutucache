@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -179,6 +180,65 @@ func TestHTTPPoolSetRebuildsOnConfigChange(t *testing.T) {
 	if n := tr.closeIdle.Load(); n != 1 {
 		t.Errorf("closeIdle called %d times for stale getter, want 1", n)
 	}
+}
+
+// 回归 #18：token 变更必须立即应用到已有 peer，而不是等下一次 Set。
+func TestSetSharedTokenRebuildsGettersImmediately(t *testing.T) {
+	p := NewHTTPPool("http://self")
+	p.Set("http://a")
+
+	oldGetter := p.httpGetters["http://a"]
+	tr := replaceTransport(oldGetter)
+
+	p.SetSharedToken("secret")
+
+	newGetter := p.httpGetters["http://a"]
+	if newGetter == oldGetter {
+		t.Fatal("existing getter was not rebuilt after token change")
+	}
+	if newGetter.sharedToken != "secret" {
+		t.Errorf("getter token = %q, want %q", newGetter.sharedToken, "secret")
+	}
+	if n := tr.closeIdle.Load(); n != 1 {
+		t.Errorf("closeIdle called %d times for stale getter, want 1", n)
+	}
+
+	// 相同 token 不应触发无谓的重建，keep-alive 连接可以保留。
+	p.SetSharedToken("secret")
+	if got := p.httpGetters["http://a"]; got != newGetter {
+		t.Fatal("setting the same token rebuilt the getter")
+	}
+}
+
+// 回归 #18：配置写入与请求读取并发进行时不能有数据竞争（配合 -race 运行）。
+func TestHTTPPoolConfigMutationConcurrentSafe(t *testing.T) {
+	p := NewHTTPPool("http://self")
+	p.Set("http://a", "http://b")
+	p.SetSharedToken("start")
+
+	var wg sync.WaitGroup
+	wg.Add(3)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			p.SetSharedToken(fmt.Sprintf("token-%d", i%2))
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			p.Set("http://a", "http://b")
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			_ = p.authorized("token-0")
+			_, _ = p.PickPeer("key")
+			_ = p.TLSConfig()
+		}
+	}()
+	wg.Wait()
 }
 
 // 回归测试 #12：未知路径返回 404，不再 panic。
