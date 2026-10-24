@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -39,6 +40,9 @@ type FileDiscovery struct {
 	self              string //本节点地址（如 "http://localhost:8001"）
 	filePath          string //共享peers.json路径
 	stopCh            chan struct{}
+	watchDone         chan struct{}
+	watchOnce         sync.Once
+	watchStarted      atomic.Bool
 	closeOnce         sync.Once
 	heartbeatInterval time.Duration //心跳重注册间隔（测试可调小）
 }
@@ -48,6 +52,7 @@ func NewFileDiscovery(self, filePath string) *FileDiscovery {
 		self:              self,
 		filePath:          filePath,
 		stopCh:            make(chan struct{}),
+		watchDone:         make(chan struct{}),
 		heartbeatInterval: defaultHeartbeat,
 	}
 }
@@ -100,15 +105,83 @@ func (d *FileDiscovery) Register(addr string) error {
 	return writeFileAtomic(d.filePath, data, 0o644)
 }
 
+// Unregister 从 peers.json 中移除指定节点地址 addr。
+// 文件不存在时视为已经注销，直接返回 nil；文件损坏时返回错误且不覆盖原文件。
+func (d *FileDiscovery) Unregister(addr string) error {
+	registerMu.Lock()
+	defer registerMu.Unlock()
+
+	lock, err := acquireFileLock(d.filePath + lockFileSuffix)
+	if err != nil {
+		return fmt.Errorf("acquire lock: %w", err)
+	}
+	defer lock.release()
+
+	existing, err := d.GetPeers()
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("read peers: %w", err)
+	}
+
+	filtered, removed := removePeer(existing, addr)
+	if !removed {
+		return nil // 地址不在列表中，无需写盘
+	}
+	data, err := json.MarshalIndent(filtered, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	return writeFileAtomic(d.filePath, data, 0o644)
+}
+
+// removePeer 删除切片中等于 addr 的元素，去重并排序。
+// 第二个返回值表示是否真的删除了 addr。
+func removePeer(list []string, addr string) ([]string, bool) {
+	seen := make(map[string]struct{}, len(list))
+	removed := false
+	for _, p := range list {
+		if p == "" {
+			continue
+		}
+		if p == addr {
+			removed = true
+			continue
+		}
+		seen[p] = struct{}{}
+	}
+	res := make([]string, 0, len(seen))
+	for p := range seen {
+		res = append(res, p)
+	}
+	sort.Strings(res)
+	return res, removed
+}
+
 // Watch 启动后台轮询：每 3 秒读一次文件，发现变化时回调 onChange。
 // 同时启动心跳，周期性地重新注册自己：即使某次写入因进程异常或外部覆盖而丢失，
 // 节点列表也会在几秒内自愈，而不是永久停留在残缺状态。
+// 每个 FileDiscovery 只会启动一个 Watch goroutine，重复调用会被忽略。
 func (d *FileDiscovery) Watch(onChange func([]string)) {
-	go d.watch(onChange)
+	d.watchOnce.Do(func() {
+		d.watchStarted.Store(true)
+		go d.watch(onChange)
+	})
 }
 
 func (d *FileDiscovery) watch(onChange func([]string)) {
-	var lastPeers []string //保存上一次读的节点列表， 用来对比是否发生变更
+	defer close(d.watchDone)
+
+	// Close 可能先于 Watch 执行；此时不需要再读取文件或触发回调。
+	select {
+	case <-d.stopCh:
+		return
+	default:
+	}
+
+	var lastPeers []string // 保存上一次读的节点列表，用来对比是否发生变更
 
 	watchTicker := time.NewTicker(watchInterval)
 	defer watchTicker.Stop()
@@ -148,9 +221,16 @@ func (d *FileDiscovery) watch(onChange func([]string)) {
 	}
 }
 
-// Close 停止后台 Watch 轮询（可重复调用）
+// Close 停止后台 Watch 轮询并等待 goroutine 退出；可重复调用。
+// 如果 Watch 从未启动，Close 不会等待（watchDone 永远不会被关闭）。
+// 返回后不会再有心跳注册：这是 Unregister 之前必须调用 Close 的原因。
 func (d *FileDiscovery) Close() {
-	d.closeOnce.Do(func() { close(d.stopCh) })
+	d.closeOnce.Do(func() {
+		close(d.stopCh)
+		if d.watchStarted.Load() {
+			<-d.watchDone
+		}
+	})
 }
 
 // mergePeers 合并已有节点与当前节点，去重并排序。
