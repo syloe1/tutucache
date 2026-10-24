@@ -172,9 +172,11 @@ func TestLoadFallsBackOnServerError(t *testing.T) {
 // valuePeerGetter 返回预置字节切片，便于观察 ByteView 是否与响应缓冲区共享底层数组。
 type valuePeerGetter struct {
 	value []byte
+	calls atomic.Int32
 }
 
 func (p *valuePeerGetter) Get(_ *pb.Request, out *pb.Response) error {
+	p.calls.Add(1)
 	out.Value = p.value
 	return nil
 }
@@ -201,6 +203,41 @@ func TestGetFromPeerClonesValue(t *testing.T) {
 	buf[0] = 'X'
 	if got := v.String(); got != "peer-data" {
 		t.Fatalf("peer value aliases response buffer: got %q", got)
+	}
+}
+
+// 回归 #15：peer 命中的值必须回填本地缓存，第二次读取不应再次访问远端。
+func TestPeerLoadPopulatesLocalCache(t *testing.T) {
+	const name = "test_peer_cache"
+	var localCalls atomic.Int32
+	peer := &valuePeerGetter{value: []byte("peer-data")}
+
+	g := NewGroup(name, 1<<10, GetterFunc(func(string) ([]byte, error) {
+		localCalls.Add(1)
+		return []byte("local-data"), nil
+	}))
+	t.Cleanup(func() {
+		mu.Lock()
+		delete(groups, name)
+		mu.Unlock()
+	})
+	g.RegisterPeers(stubPicker{g: peer})
+
+	for i := 0; i < 2; i++ {
+		v, err := g.Get("key")
+		if err != nil {
+			t.Fatalf("Get #%d: %v", i+1, err)
+		}
+		if got := v.String(); got != "peer-data" {
+			t.Fatalf("Get #%d value = %q, want %q", i+1, got, "peer-data")
+		}
+	}
+
+	if got := peer.calls.Load(); got != 1 {
+		t.Fatalf("peer calls = %d, want 1: second read should hit local cache", got)
+	}
+	if got := localCalls.Load(); got != 0 {
+		t.Fatalf("local getter calls = %d, want 0", got)
 	}
 }
 
