@@ -97,8 +97,9 @@ func (g *grpcGetter) close() error {
 // GRPCPool 管理一组 gRPC 缓存节点（类似 HTTPPool），负责节点发现和负载均衡
 type GRPCPool struct {
 	self        string                 // 本节点地址，如 "localhost:8001"
-	mu          sync.Mutex             // 保护 peers 和 grpcGetters
+	mu          sync.Mutex             // 保护 peers、peersList 和 grpcGetters
 	peers       *consistenthash.Map    // 一致性哈希环，映射 key → 节点
+	peersList   []string               // 上一次 Set 的节点列表，用于差集更新哈希环
 	grpcGetters map[string]*grpcGetter // 节点地址 → gRPC 客户端
 	grpcServer  *grpc.Server           // 本节点的 gRPC server
 	stopped     bool                   // Stop 后置位，阻止后续 Set 重新建立客户端连接
@@ -131,11 +132,18 @@ func (p *GRPCPool) Set(peers ...string) {
 		return
 	}
 
-	// 新节点集合，用于差集判断
+	// 去重并保留首次出现顺序；newPeerSet 同时用于 getter 差集判断，
+	// 避免重复节点被重复加入哈希环。
 	newPeerSet := make(map[string]struct{}, len(peers))
+	unique := make([]string, 0, len(peers))
 	for _, peer := range peers {
+		if _, ok := newPeerSet[peer]; ok {
+			continue
+		}
 		newPeerSet[peer] = struct{}{}
+		unique = append(unique, peer)
 	}
+	peers = unique
 	// 找出旧 getter 中不在新列表里的 peer：锁内只摘除，锁外再关闭。
 	// 关闭连接需要拆解 resolver/balancer，放到锁外可避免阻塞 PickPeer。
 	stale := make(map[string]*grpcGetter)
@@ -146,9 +154,9 @@ func (p *GRPCPool) Set(peers ...string) {
 		}
 	}
 
-	// 构建一致性哈希环
-	p.peers = consistenthash.New(defaultGRPCReplicas, nil)
-	p.peers.Add(peers...)
+	// 按差集增量更新哈希环：只删除下线节点、添加新增节点，避免整环重建。
+	p.peers = updateRing(p.peers, defaultGRPCReplicas, p.peersList, peers)
+	p.peersList = append([]string(nil), peers...)
 
 	// 为每个对端节点创建 gRPC 客户端（复用连接）
 	for _, peer := range peers {
