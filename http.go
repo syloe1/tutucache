@@ -180,7 +180,15 @@ func (p *HTTPPool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 无法再与路径分隔符区分。正确做法是先按 "/" 切段，再逐段 PathUnescape。
 	escapedPath := r.URL.EscapedPath()
 	if !strings.HasPrefix(escapedPath, p.basePath) {
-		panic("HTTPPool serving unexpected path: " + escapedPath)
+		// ServeHTTP 是整个节点的根 handler，扫描器或健康检查随时可能请求任意路径；
+		// 这里不能用 panic 做路由控制，否则每个请求都会打出一份堆栈并重置连接。
+		http.NotFound(w, r)
+		return
+	}
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
 	}
 	p.Log("%s %s", r.Method, escapedPath)
 	// 把前缀切掉

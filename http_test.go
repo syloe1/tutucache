@@ -7,6 +7,8 @@ import (
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
+
+	"google.golang.org/protobuf/proto"
 )
 
 // trackingTransport 只用于观察 CloseIdleConnections 是否被调用。
@@ -148,4 +150,178 @@ func TestHTTPPoolSetRebuildsOnConfigChange(t *testing.T) {
 	if n := tr.closeIdle.Load(); n != 1 {
 		t.Errorf("closeIdle called %d times for stale getter, want 1", n)
 	}
+}
+
+// 回归测试 #12：未知路径返回 404，不再 panic。
+func TestServeHTTPUnknownPathReturnsNotFound(t *testing.T) {
+	p := NewHTTPPool("http://self")
+	for _, tc := range []struct{ name, path string }{
+		{"root", "/"},
+		{"favicon", "/favicon.ico"},
+		{"robots", "/robots.txt"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			// 直接调用 ServeHTTP：若仍 panic，测试会直接失败；
+			// 走 httptest.NewServer 会被 net/http recover 成连接重置，把问题掩盖掉。
+			p.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, tc.path, nil))
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("status = %d, want %d", rec.Code, http.StatusNotFound)
+			}
+		})
+	}
+}
+
+// 回归测试 #12：缓存端点只允许 GET；非 GET 不能触发 getter。
+func TestServeHTTPRejectsNonGETOnCachePath(t *testing.T) {
+	var calls atomic.Int32
+	// group 名要唯一，避免和别的测试互相覆盖全局 groups。
+	NewGroup("http-method-check", 1<<20, GetterFunc(func(string) ([]byte, error) {
+		calls.Add(1)
+		return []byte("v"), nil
+	}))
+
+	p := NewHTTPPool("http://self")
+	for _, method := range []string{
+		http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodPatch,
+	} {
+		t.Run(method, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			p.ServeHTTP(rec, httptest.NewRequest(method,
+				"/_geecache/http-method-check/k", nil))
+			if rec.Code != http.StatusMethodNotAllowed {
+				t.Fatalf("status = %d, want %d", rec.Code, http.StatusMethodNotAllowed)
+			}
+			// RFC 9110 要求 405 响应必须带 Allow 头。
+			if got := rec.Header().Get("Allow"); got != http.MethodGet {
+				t.Errorf("Allow = %q, want %q", got, http.MethodGet)
+			}
+		})
+	}
+	if n := calls.Load(); n != 0 {
+		t.Errorf("getter called %d times for non-GET requests, want 0", n)
+	}
+}
+
+// 回归测试 #12：方法检查不能误伤正常的 GET 读路径。
+func TestServeHTTPCacheEndpointGetOK(t *testing.T) {
+	const (
+		testGroup = "http-get-ok"
+		testKey   = "hello"
+		testValue = "geecache-value-123"
+	)
+	NewGroup(testGroup, 1<<10, GetterFunc(func(key string) ([]byte, error) {
+		if key == testKey {
+			return []byte(testValue), nil
+		}
+		return []byte("default-" + key), nil
+	}))
+
+	p := NewHTTPPool("http://self")
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, defaultBasePath+testGroup+"/"+testKey, nil)
+
+	p.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body = %q", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	// 解码 proto body
+	var resp pb.Response
+	if err := proto.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response failed: %v", err)
+	}
+	if string(resp.Value) != testValue {
+		t.Fatalf("value = %q, want %q", string(resp.Value), testValue)
+	}
+}
+
+// 回归测试 #12：认证先于路由和方法检查——配置 token 后，
+// 未认证请求一律 401，认证通过后未知路径才是 404、非 GET 才是 405。
+func TestServeHTTPTokenOrder(t *testing.T) {
+	const fakeToken = "secret-token-xyz"
+
+	// 配置 token，不带 header：连 unknown 路径都先吃 401（认证优先于路由）
+	t.Run("no_token_header_rejects_unknown_path_with_401", func(t *testing.T) {
+		p := NewHTTPPool("http://self")
+		p.SetSharedToken(fakeToken)
+
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/some/unknown/path", nil)
+		p.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want %d (auth must run before routing)", rec.Code, http.StatusUnauthorized)
+		}
+	})
+
+	// 配置 token + 正确 header：unknown 路径返回 404，POST 缓存路径返回 405
+	t.Run("correct_token_allows_routing_then_404_and_405", func(t *testing.T) {
+		p := NewHTTPPool("http://self")
+		p.SetSharedToken(fakeToken)
+
+		// unknown path → 404
+		rec1 := httptest.NewRecorder()
+		req1 := httptest.NewRequest(http.MethodGet, "/some/unknown/path", nil)
+		req1.Header.Set(SharedTokenHeader, fakeToken)
+		p.ServeHTTP(rec1, req1)
+		if rec1.Code != http.StatusNotFound {
+			t.Fatalf("unknown path status = %d, want %d", rec1.Code, http.StatusNotFound)
+		}
+
+		// POST /_geecache/g/k → 405
+		rec2 := httptest.NewRecorder()
+		req2 := httptest.NewRequest(http.MethodPost, defaultBasePath+"somegroup/somekey", nil)
+		req2.Header.Set(SharedTokenHeader, fakeToken)
+		p.ServeHTTP(rec2, req2)
+		if rec2.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("POST cache endpoint status = %d, want %d", rec2.Code, http.StatusMethodNotAllowed)
+		}
+	})
+
+	// 配置 token + 错误 header：直接 401，不管什么路径
+	t.Run("wrong_token_header_rejects_with_401", func(t *testing.T) {
+		p := NewHTTPPool("http://self")
+		p.SetSharedToken(fakeToken)
+
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, defaultBasePath+"g/k", nil)
+		req.Header.Set(SharedTokenHeader, "wrong-token")
+		p.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("wrong token status = %d, want %d", rec.Code, http.StatusUnauthorized)
+		}
+	})
+}
+
+// 回归测试 #12：/health 和 /metrics 仍按原语义处理，不受方法检查影响。
+func TestServeHTTPHealthAndMetricsUnaffected(t *testing.T) {
+	p := NewHTTPPool("http://self")
+
+	t.Run("health_returns_200", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/health", nil)
+		p.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("/health status = %d, want %d", rec.Code, http.StatusOK)
+		}
+		if rec.Body.String() != "OK" {
+			t.Fatalf("/health body = %q, want %q", rec.Body.String(), "OK")
+		}
+	})
+
+	t.Run("metrics_returns_200", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+		p.ServeHTTP(rec, req)
+
+		// MetricsHandler 只要不 panic、返回 200 就算正常
+		if rec.Code != http.StatusOK {
+			t.Fatalf("/metrics status = %d, want %d", rec.Code, http.StatusOK)
+		}
+	})
 }
