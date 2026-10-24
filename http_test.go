@@ -326,6 +326,39 @@ func TestServeHTTPTokenOrder(t *testing.T) {
 	})
 }
 
+// 回归 #22：token 校验改为恒定时间比较后，语义必须保持不变，
+// 包括前缀相同、长度不同、空 header 等边界。
+func TestAuthorizedComparesTokenCorrectly(t *testing.T) {
+	p := NewHTTPPool("http://self")
+
+	// 未配置 token 时不鉴权。
+	if !p.authorized("") || !p.authorized("anything") {
+		t.Fatal("empty token config must disable auth")
+	}
+
+	const token = "super-secret"
+	p.SetSharedToken(token)
+
+	tests := []struct {
+		name string
+		got  string
+		want bool
+	}{
+		{"exact match", token, true},
+		{"last byte differs", "super-secreT", false},
+		{"prefix only", "super-secre", false},
+		{"longer than token", token + "-longer", false},
+		{"empty header", "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := p.authorized(tt.got); got != tt.want {
+				t.Fatalf("authorized(%q) = %v, want %v", tt.got, got, tt.want)
+			}
+		})
+	}
+}
+
 // 回归测试 #12：/health 和 /metrics 仍按原语义处理，不受方法检查影响。
 func TestServeHTTPHealthAndMetricsUnaffected(t *testing.T) {
 	p := NewHTTPPool("http://self")
