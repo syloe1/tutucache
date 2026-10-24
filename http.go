@@ -72,7 +72,8 @@ type HTTPPool struct {
 	peers       *consistenthash.Map    // 一致性哈希环，保存所有集群节点
 	peersList   []string               // 上一次 Set 的节点列表（已按当前 scheme 归一化）
 	httpGetters map[string]*httpGetter // key:节点地址，value:该节点的http客户端
-	// 服务端 TLS 配置，挂到本地 http.Server。EnableTLS 返回后视为只读。
+	// 服务端 TLS 配置，挂到本地 http.Server。TLSConfig() 返回的快照视为只读，
+	// 再次调用 EnableTLS 会整体替换这里的指针。
 	serverTLSConfig *tls.Config
 	// 客户端 TLS 配置，供访问 peer 的 httpGetter 使用。非 nil 表示节点间通信走 https。
 	clientTLSConfig *tls.Config
@@ -93,7 +94,8 @@ func NewHTTPPool(self string) *HTTPPool {
 // 同一个证书同时用于服务端和客户端角色，因此证书 SAN 必须覆盖 peer 实际
 // 拨号的地址；启用 mTLS 时证书还需要 clientAuth EKU。
 //
-// 必须在 StartDiscovery/Set 之前调用。返回后两份配置都视为只读。
+// 可在 Set/StartDiscovery 之后调用：配置更新会立即应用到已有 peer 的 getter。
+// 通过 TLSConfig() 取到的快照视为只读；再次调用会整体替换配置。
 func (p *HTTPPool) EnableTLS(certFile, keyFile, caCertFile string) error {
 	// 加载节点证书 + 私钥对
 	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
@@ -130,18 +132,26 @@ func (p *HTTPPool) EnableTLS(certFile, keyFile, caCertFile string) error {
 	}
 
 	p.mu.Lock()
+	defer p.mu.Unlock()
 	p.serverTLSConfig = serverCfg
 	p.clientTLSConfig = clientCfg
-	p.mu.Unlock()
+	// getter 在创建时快照 TLS 配置，切换后必须立即重建，
+	// 否则已有 peer 仍会用明文/旧证书通信。
+	p.rebuildGettersLocked()
 	return nil
 }
 
 // SetSharedToken 设置共享 Token（最简单内网认证方式）。
-// 必须在 StartDiscovery/Set 之前调用。
+// 可在 Set/StartDiscovery 之后调用：更新会立即应用到已有 peer 的 getter。
 func (p *HTTPPool) SetSharedToken(token string) {
 	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.sharedToken == token {
+		return // 配置没变，避免无谓地重建 transport
+	}
 	p.sharedToken = token
-	p.mu.Unlock()
+	// getter 在创建时快照 token，变更后不重建会让已有 peer 继续发送旧 token。
+	p.rebuildGettersLocked()
 }
 
 // authorized 校验请求携带的共享 token；未配置 token 时不做鉴权。
@@ -269,7 +279,12 @@ func (p *HTTPPool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (p *HTTPPool) Set(peers ...string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.setLocked(peers)
+}
 
+// setLocked 是 Set 的主体，调用方必须持有 p.mu。
+// 认证/TLS 配置变化后，setter 也通过它立即重建 getter。
+func (p *HTTPPool) setLocked(peers []string) {
 	// 按当前 TLS 模式统一 peer 的 scheme，并去重：
 	// peers.json 中可能同时残留 http:// 与 https:// 两种写法，归一化后会重复。
 	// 集群要求所有节点使用一致的 TLS 配置，因此以本节点的模式为准。
@@ -290,8 +305,8 @@ func (p *HTTPPool) Set(peers ...string) {
 	}
 	peers = normalized
 
-	// FileDiscovery 每 3 秒回调一次。节点集合和认证/TLS 配置都没变时直接返回，
-	// 避免周期性地重建哈希环和全部 transport（重建会让 keep-alive 连接失去复用）。
+	// 节点集合和认证/TLS 配置都没变时直接返回，避免重建哈希环和全部
+	// transport（重建会让 keep-alive 连接失去复用）。
 	if sameSlice(peers, p.peersList) && p.gettersCurrent() {
 		return
 	}
@@ -324,6 +339,15 @@ func (p *HTTPPool) Set(peers ...string) {
 			getter.close()
 		}
 	}
+}
+
+// rebuildGettersLocked 用当前节点列表和最新认证/TLS 配置重建 getter。
+// getter 在创建时快照 token/TLS，因此配置变化后必须立即重建，
+// 否则已有 peer 会一直使用旧配置（issue #18）。调用方必须持有 p.mu。
+func (p *HTTPPool) rebuildGettersLocked() {
+	// peersList 保存的是归一化后的地址；setLocked 会按当前 scheme 再归一化一次，
+	// 因此 EnableTLS 切换 http→https 时也能正确重建。
+	p.setLocked(p.peersList)
 }
 
 // peerScheme 返回当前节点间通信使用的 URL scheme。
