@@ -22,6 +22,12 @@ import (
 //                   保证半开期间只放行一个探测请求。
 // =============================================================================
 
+const (
+	// 每个 (Group, peer) 熔断器的默认参数：连续失败 3 次熔断 10 秒。
+	defaultBreakerFailureThreshold = 3
+	defaultBreakerTimeout          = 10 * time.Second
+)
+
 type State int
 
 const (
@@ -47,6 +53,23 @@ type CircuitBreaker struct {
 	lastFailure   time.Time     // 仅在进入 Open 时设置，冷却从这里开始计算
 	generation    uint64        // 当前状态代数，从 1 开始，每次状态迁移自增
 	probeInFlight bool          // HalfOpen 探测名额是否已被占用
+}
+
+// peerBreakers 为一个 peer 保存按 Group 隔离的熔断器。
+// 每个 httpGetter/grpcGetter 各持有一个实例：失败只影响该节点，不会波及
+// 路由到其他节点的请求；节点从拓扑中移除时 getter 被丢弃，熔断状态随之回收，
+// 不需要在 Group 侧额外维护 map 和清理逻辑。
+type peerBreakers struct {
+	m sync.Map // map[string]*CircuitBreaker，key 为 Group name
+}
+
+// get 返回指定 Group 对应的熔断器，不存在时按默认参数创建。
+func (p *peerBreakers) get(group string) *CircuitBreaker {
+	if cb, ok := p.m.Load(group); ok {
+		return cb.(*CircuitBreaker)
+	}
+	cb, _ := p.m.LoadOrStore(group, NewCircuitBreaker(defaultBreakerFailureThreshold, defaultBreakerTimeout))
+	return cb.(*CircuitBreaker)
 }
 
 // NewCircuitBreaker 创建熔断器，thresh 为失败阈值，timeout 为熔断恢复等待

@@ -54,10 +54,20 @@ type grpcGetter struct {
 	addr   string
 	client pb.GroupCacheClient
 	conn   *grpc.ClientConn
+	// breakers 按 Group 隔离该 peer 的熔断状态；随 getter 生命周期创建和回收。
+	breakers peerBreakers
 }
 
-// 编译期断言：grpcGetter 实现了 PeerGetter
-var _ PeerGetter = (*grpcGetter)(nil)
+// 编译期断言：grpcGetter 实现了 PeerGetter 与 PeerBreakerProvider
+var (
+	_ PeerGetter          = (*grpcGetter)(nil)
+	_ PeerBreakerProvider = (*grpcGetter)(nil)
+)
+
+// BreakerFor 返回该 peer 在指定 Group 下的熔断器（实现 PeerBreakerProvider）。
+func (g *grpcGetter) BreakerFor(group string) *CircuitBreaker {
+	return g.breakers.get(group)
+}
 
 // String 返回对端地址，便于日志输出。
 func (g *grpcGetter) String() string {

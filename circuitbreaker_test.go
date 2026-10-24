@@ -2,12 +2,16 @@ package geecache
 
 import (
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	pb "geecache/geecachepb"
+
+	"google.golang.org/protobuf/proto"
 )
 
 // breakerSnapshot 在锁内读取熔断器状态，避免测试本身引入数据竞争。
@@ -357,5 +361,110 @@ func TestCircuitBreaker_GetFromPeerFastFails(t *testing.T) {
 	}
 	if got := peer.calls.Load(); got != 3 {
 		t.Fatalf("peer called %d times, want 3 (fourth rejected by breaker)", got)
+	}
+}
+
+// 回归 #14：熔断器必须按 peer 隔离。一个坏节点的连续失败只能熔断它自己，
+// 不能把同一 Group 内路由到健康节点的请求一起短路。
+func TestCircuitBreakerIsPerPeer(t *testing.T) {
+	badSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer badSrv.Close()
+	goodSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		body, err := proto.Marshal(&pb.Response{Value: []byte("ok")})
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Write(body)
+	}))
+	defer goodSrv.Close()
+
+	g := NewGroup("cb-per-peer", 1<<20, GetterFunc(func(string) ([]byte, error) {
+		return []byte("local"), nil
+	}))
+	bad := newHTTPGetter(badSrv.URL+defaultBasePath, nil, "")
+	good := newHTTPGetter(goodSrv.URL+defaultBasePath, nil, "")
+
+	for i := 0; i < defaultBreakerFailureThreshold; i++ {
+		if _, err := g.getFromPeer(bad, "k"); err == nil {
+			t.Fatalf("bad peer call %d: expected error", i+1)
+		}
+	}
+	if _, err := g.getFromPeer(bad, "k"); !errors.Is(err, ErrCircuitOpen) {
+		t.Fatalf("bad peer breaker should be open, got %v", err)
+	}
+
+	// 健康 peer 的熔断器必须仍然是 Closed。
+	v, err := g.getFromPeer(good, "k")
+	if err != nil {
+		t.Fatalf("healthy peer short-circuited by another peer's breaker: %v", err)
+	}
+	if v.String() != "ok" {
+		t.Fatalf("healthy peer value = %q, want %q", v.String(), "ok")
+	}
+}
+
+// 回归 #14：同一个 peer 在不同 Group 下的熔断状态也必须相互独立。
+func TestCircuitBreakerIsPerGroupForSamePeer(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	getter := newHTTPGetter(srv.URL+defaultBasePath, nil, "")
+	g1 := NewGroup("cb-group-a", 1<<20, GetterFunc(func(string) ([]byte, error) {
+		return []byte("a"), nil
+	}))
+	g2 := NewGroup("cb-group-b", 1<<20, GetterFunc(func(string) ([]byte, error) {
+		return []byte("b"), nil
+	}))
+
+	for i := 0; i < defaultBreakerFailureThreshold; i++ {
+		if _, err := g1.getFromPeer(getter, "k"); err == nil {
+			t.Fatalf("group a call %d: expected error", i+1)
+		}
+	}
+	if _, err := g1.getFromPeer(getter, "k"); !errors.Is(err, ErrCircuitOpen) {
+		t.Fatalf("group a breaker should be open, got %v", err)
+	}
+
+	// g2 仍然应该真实访问 peer（拿到 500），而不是被 g1 的熔断器短路。
+	_, err := g2.getFromPeer(getter, "k")
+	if errors.Is(err, ErrCircuitOpen) {
+		t.Fatal("group b was short-circuited by group a's breaker")
+	}
+	var peerErr *PeerHTTPError
+	if !errors.As(err, &peerErr) || peerErr.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("group b error = %v, want HTTP 500", err)
+	}
+}
+
+// 回归 #14：peer 下线后 getter 被丢弃，其熔断状态也必须随之回收；
+// 节点重新上线时应使用全新的熔断器。
+func TestPeerBreakerDroppedWhenPeerRemoved(t *testing.T) {
+	pool := NewHTTPPool("http://self")
+	pool.Set("http://peer-a")
+
+	pool.mu.Lock()
+	first := pool.httpGetters["http://peer-a"]
+	pool.mu.Unlock()
+	if first == nil {
+		t.Fatal("peer getter was not created")
+	}
+	firstBreaker := first.BreakerFor("some-group")
+
+	pool.Set()                // 节点下线
+	pool.Set("http://peer-a") // 重新上线 → 新 getter
+
+	pool.mu.Lock()
+	second := pool.httpGetters["http://peer-a"]
+	pool.mu.Unlock()
+	if second == nil || second == first {
+		t.Fatal("expected a fresh getter after peer removal")
+	}
+	if cb := second.BreakerFor("some-group"); cb == firstBreaker {
+		t.Fatal("breaker state leaked across peer removal")
 	}
 }

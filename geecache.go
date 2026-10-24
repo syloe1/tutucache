@@ -52,7 +52,8 @@ type Group struct {
 	loader *singleflight.Group
 	// defaultTTL 默认过期时间，0 表示永不过期
 	defaultTTL time.Duration
-	// breaker 远程节点熔断器，失败 N 次后跳过远程直接降级到本地
+	// breaker 兜底熔断器：仅用于没有实现 PeerBreakerProvider 的自定义 PeerGetter。
+	// 内置的 httpGetter/grpcGetter 会按 (Group, peer) 提供独立熔断器，见 breakerFor。
 	breaker *CircuitBreaker
 	metrics *Metrics
 }
@@ -118,7 +119,7 @@ func NewGroup(name string, cacheBytes int64, getter Getter) *Group {
 			onEvicted: func(lru.EvictItem) { m.RecordEviction() },
 		},
 		loader:  singleflight.NewGroup(),
-		breaker: NewCircuitBreaker(3, 10*time.Second), // 连续失败3次 → 熔断10秒
+		breaker: NewCircuitBreaker(defaultBreakerFailureThreshold, defaultBreakerTimeout), // 连续失败3次 → 熔断10秒
 	}
 	groups[name] = g
 	return g
@@ -186,11 +187,25 @@ func (g *Group) load(key string) (value ByteView, err error) {
 	return
 }
 
+// breakerFor 返回 peer 在当前 Group 下使用的熔断器。
+// 内置 PeerGetter 实现了 PeerBreakerProvider，按 (Group, peer) 隔离：
+// 节点 A 的连续失败只会熔断发往 A 的请求，发往健康节点 B 的请求不受影响。
+// 未实现该接口的自定义 PeerGetter 退回 Group 级兜底熔断器，保持旧行为。
+func (g *Group) breakerFor(peer PeerGetter) *CircuitBreaker {
+	if p, ok := peer.(PeerBreakerProvider); ok {
+		if cb := p.BreakerFor(g.name); cb != nil {
+			return cb
+		}
+	}
+	return g.breaker
+}
+
 // 向远程GeeCache节点发起网络请求，获取缓存
 func (g *Group) getFromPeer(peer PeerGetter, key string) (ByteView, error) {
+	breaker := g.breakerFor(peer)
 	// 熔断器打开 → 快速失败，上层 load() 自动降级到 getLocal()
 	// ticket 记录获准时的状态代数，迟到/失效的结果不会污染新状态
-	ticket, ok := g.breaker.Allow()
+	ticket, ok := breaker.Allow()
 	if !ok {
 		return ByteView{}, ErrCircuitOpen
 	}
@@ -207,14 +222,14 @@ func (g *Group) getFromPeer(peer PeerGetter, key string) (ByteView, error) {
 		case isPeerConfigError(err):
 			// 配置错误说明对端可达，不计入熔断失败；但 ticket 必须回填，
 			// 否则 HalfOpen 的探测名额会被永久占用。
-			g.breaker.RecordNeutral(ticket)
+			breaker.RecordNeutral(ticket)
 		default:
-			g.breaker.RecordFailure(ticket) // 失败计数+1
+			breaker.RecordFailure(ticket) // 失败计数+1
 		}
 		return ByteView{}, err
 	}
 
-	g.breaker.RecordSuccess(ticket) // 成功 → 重置熔断器
+	breaker.RecordSuccess(ticket) // 成功 → 重置熔断器
 	g.metrics.RecordPeerLoad()
 	// 与 getLocal 保持一致：深拷贝后再封装，保证 ByteView 独占底层数组。
 	// 否则响应缓冲区后续被复用或写入缓存时，缓存值与调用方会共享同一块内存。
